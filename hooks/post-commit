@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# A Leapfrog commit on the main machine copies the checkout to the MacBook through the
+# machine repo's existing ship-sync service. Everywhere else this is a no-op.
+[ "$(hostname)" = the-main-machine ] || exit 0
+[ -d "the machine repo's checkout/.git" ] || exit 0
+systemctl --user start --no-block ship-syncthe MacBook agent.service 2>/dev/null || true
+exit 0
