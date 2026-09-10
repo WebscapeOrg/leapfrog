@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 — 2026-09-10
+
+- Added an inert staging-tree mode for the main machine, so the exact marketplace
+  lock plugin is guarded before it is copied to the MacBook.
+
 ## 0.2.0 — 2026-09-10
 
 - Prevented an unavailable T1 keybag service from causing an unlimited
