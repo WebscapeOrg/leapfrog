@@ -16,7 +16,7 @@ renderer.
 
 ## Asking Dave for decisions: Settlers of Questan
 
-Before you start work in a repository, read `~/Downloads/settlers-of-questan-agent-instructions.md`
+Before you start work in a repository, read `~/.local/share/pickle/agent-instructions.md`
 and follow it. It is how you ask Dave for decisions, and it says where his earlier answers are
 recorded. Do not copy its contents into this file or any other file: it is kept in one place so
 that a change to it reaches every agent.
