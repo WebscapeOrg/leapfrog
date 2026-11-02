@@ -26,48 +26,223 @@ source = Path(sys.argv[1]).read_text()
 compile(source, sys.argv[1], "exec")
 PY
 
-# The Enterprise ship sync patches an inert marketplace-plugin staging tree.
-# Exercise that public interface even when the live plugin is already guarded.
-if [ -f "$HOME/.config/omarchy/plugins/io.github.sirjul1337.lock-explorer/Service.qml" ]; then
-  staged_lock_test="$(mktemp -d)"
-  trap 'find "$staged_lock_test" -depth -delete' EXIT
-  cp "$HOME/.config/omarchy/plugins/io.github.sirjul1337.lock-explorer/Service.qml" \
-    "$staged_lock_test/Service.qml"
-  cp "$HOME/.config/omarchy/plugins/io.github.sirjul1337.lock-explorer/manifest.json" \
-    "$staged_lock_test/manifest.json"
-  "$LEAPFROG_DIR/lock/install" --plugin-dir "$staged_lock_test" >/dev/null
+# The Enterprise ship sync patches an inert marketplace-plugin staging tree. These cases exercise
+# that public interface, which is the only one the sync uses.
+#
+# ⚠️ NOTHING HERE MAY ASSUME THE LOCAL PLUGIN IS GUARDED. The guard is applied on Voyager and not on
+# Enterprise, and Enterprise is where the commit is verified. A version of this check that assumed
+# "guarded" failed its first case there, and silently skipped the one case that enforces --forward —
+# the defect it exists to catch (@enterprise, hobnob #6670). So one UNGUARDED base is derived from
+# whatever the local copy happens to be, and every tree below is built from that base.
+lock_plugin="$HOME/.config/omarchy/plugins/io.github.sirjul1337.lock-explorer"
+if [ -f "$lock_plugin/Service.qml" ]; then
+  lock_base="$(mktemp -d)"
+  lock_work="$(mktemp -d)"
+  trap 'find "$lock_base" "$lock_work" -depth -delete' EXIT
+  cp "$lock_plugin/Service.qml" "$lock_base/Service.qml"
+  cp "$lock_plugin/manifest.json" "$lock_base/manifest.json"
 
-  # ...and again on an UNGUARDED stage, the path the ship sync actually takes. A copy of the
-  # live tree is already guarded, so the run above takes the "current" early exit and never
-  # reaches the candidate probes. That blind spot is how a probe's "1 out of 6 hunks FAILED"
-  # reached sync-ship's note on a run that went on to succeed and exit 0 (Enterprise, hobnob
-  # #6586, 2026-11-02); sync-ship folds our stdout and stderr into that note, so the normal
-  # path has to stay quiet.
-  if patch -R --forward --batch --silent -d "$staged_lock_test" -p1 \
-      < "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch" 2>/dev/null; then
-    unguarded_status=0
-    unguarded_output="$("$LEAPFROG_DIR/lock/install" --plugin-dir "$staged_lock_test" 2>&1)" \
-      || unguarded_status=$?
-    if [ "$unguarded_status" -ne 0 ]; then
-      printf 'lock/install failed on an unguarded stage (%d): %s\n' \
-        "$unguarded_status" "$unguarded_output" >&2
+  lock_base_ok=yes
+  if grep -qF 'property int fingerprintFastFailures' "$lock_base/Service.qml"; then
+    # ⚠️ >/dev/null 2>&1, not 2>/dev/null. patch writes "Unreversed patch detected! Skipping patch."
+    # and "saving rejects to file Service.qml.rej" to STDOUT, so half a redirection leaks them into
+    # this script's own output (@enterprise, hobnob #6670).
+    patch -R --forward --batch --silent --no-backup-if-mismatch -d "$lock_base" -p1 \
+      < "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch" >/dev/null 2>&1 || lock_base_ok=no
+  fi
+  rm -f "$lock_base"/*.orig "$lock_base"/*.rej
+  grep -qF 'property int fingerprintFastFailures' "$lock_base/Service.qml" && lock_base_ok=no
+
+  if [ "$lock_base_ok" != yes ]; then
+    printf 'script/check: lock-guard cases SKIPPED — no unguarded base could be derived\n' >&2
+  else
+    lock_tree() { # lock_tree <name> — a fresh copy of the unguarded base
+      rm -rf "${lock_work:?}/$1"
+      mkdir -p "$lock_work/$1"
+      cp "$lock_base/Service.qml" "$lock_base/manifest.json" "$lock_work/$1/"
+      printf '%s\n' "$lock_work/$1"
+    }
+    lock_guard() { # lock_guard <dir> — apply the v1.7 guard, quietly
+      patch --forward --batch --silent --no-backup-if-mismatch -d "$1" -p1 \
+        < "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch" >/dev/null 2>&1
+      rm -f "$1"/*.orig "$1"/*.rej
+    }
+    lock_run() { # lock_run <dir> — stdout+stderr of the guard, status in lock_status
+      lock_status=0
+      lock_output="$("$LEAPFROG_DIR/lock/install" --plugin-dir "$1" 2>&1)" || lock_status=$?
+    }
+
+    # 0. The checksum manifest must match the patch files. lock/install refuses to run when they
+    #    disagree, so this only exists to fail with a clear message here rather than on a ship.
+    if ! (cd "$LEAPFROG_DIR/lock" && sha256sum --check --quiet --strict patch-checksums.txt) >/dev/null 2>&1
+    then
+      printf 'lock/patch-checksums.txt does not match the patch files; update it in this change\n' >&2
+      ( cd "$LEAPFROG_DIR/lock" && sha256sum --check --strict patch-checksums.txt ) 2>&1 | grep -v ': OK$' >&2
       exit 1
     fi
-    case "$unguarded_output" in
-      *FAILED*)
-        printf 'lock/install leaked a patch probe into its output: %s\n' "$unguarded_output" >&2
+    for candidate_name in fingerprint-circuit-breaker.patch fingerprint-circuit-breaker-v1.7.patch; do
+      if ! grep -qF "  $candidate_name" "$LEAPFROG_DIR/lock/patch-checksums.txt"; then
+        printf 'lock/patch-checksums.txt does not list %s\n' "$candidate_name" >&2
         exit 1
-        ;;
-    esac
-    case "$unguarded_output" in
-      *'leapfrog-lock: changed'*) ;;
+      fi
+    done
+
+    # 1. A guarded tree reports exactly one line. Not a substring: the ship sync's note is this
+    #    whole stream, so one extra line is one false alarm.
+    tree="$(lock_tree guarded)"; lock_guard "$tree"; lock_run "$tree"
+    if [ "$lock_status" -ne 0 ] || [ "$lock_output" != "leapfrog-lock: current" ]; then
+      printf 'lock/install did not report exactly "leapfrog-lock: current" on a guarded tree.\n' >&2
+      printf '  exit: %s\n  got:  %s\n' "$lock_status" "$lock_output" >&2
+      exit 1
+    fi
+
+    # 2. An unguarded stage — the path the ship sync actually takes — reports exactly one line.
+    #    A leaked probe line here is how "1 out of 6 hunks FAILED" reached the sync's note on a run
+    #    that went on to succeed and exit 0 (@enterprise, hobnob #6586).
+    expected_change="leapfrog-lock: changed with fingerprint-circuit-breaker-v1.7.patch"
+    expected_change="$expected_change (restart the shell while unlocked, or sign in again)"
+    tree="$(lock_tree unguarded)"; lock_run "$tree"
+    if [ "$lock_status" -ne 0 ] || [ "$lock_output" != "$expected_change" ]; then
+      printf 'lock/install did not report exactly one change line on an unguarded stage.\n' >&2
+      printf '  exit: %s\n  expected: %s\n  got:      %s\n' \
+        "$lock_status" "$expected_change" "$lock_output" >&2
+      exit 1
+    fi
+    if [ -e "$tree/Service.qml.orig" ]; then
+      printf 'lock/install left a backup beside the plugin after a clean apply\n' >&2
+      exit 1
+    fi
+
+    # 3. ⚠️ THE CASE THAT ENFORCES --forward ON THE REVERSE PROBE, and the only one that does. A
+    #    hunk-1-only tree is refused with or without the flag, so the obvious part-patched case
+    #    proves nothing about it: four mutants passed while it stood alone (@enterprise, #6639).
+    #    A MARKER-ONLY tree discriminates — the marker sits where hunk 1 would put it, so hunk 1
+    #    reverses cleanly, and without --forward patch treats the other five as already-reversed
+    #    and calls the tree whole.
+    tree="$(lock_tree markeronly)"
+    awk '{ print }
+      /property bool authenticatingPassword: false/ && !seen {
+        print "  property int fingerprintFastFailures: 0"; seen = 1
+      }' "$tree/Service.qml" > "$tree/Service.qml.new"
+    mv "$tree/Service.qml.new" "$tree/Service.qml"
+    if ! grep -qF 'property int fingerprintFastFailures' "$tree/Service.qml"; then
+      printf 'script/check: could not build a marker-only tree; the anchor line moved\n' >&2
+      exit 1
+    fi
+    lock_run "$tree"
+    if [ "$lock_status" -eq 0 ]; then
+      printf 'lock/install reported a marker-only tree as whole. Is --forward on the reverse probe?\n' >&2
+      printf '  got: %s\n' "$lock_output" >&2
+      exit 1
+    fi
+
+    # 4. A tree with hunk 1 applied and the rest missing must be refused, and must keep its backup:
+    #    deleting it while rejecting a part-patched plugin takes the file away exactly when someone
+    #    needs it (@enterprise, hobnob #6639).
+    tree="$(lock_tree hunk1only)"
+    awk '/^@@/ { hunks++ } hunks < 2 { print } hunks >= 2 { exit }' \
+      "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch" > "$lock_work/hunk1.patch"
+    patch --forward --batch --silent --no-backup-if-mismatch -d "$tree" -p1 \
+      < "$lock_work/hunk1.patch" >/dev/null 2>&1
+    rm -f "$tree"/*.orig "$tree"/*.rej
+    cp "$tree/Service.qml" "$tree/Service.qml.orig"
+    lock_run "$tree"
+    if [ "$lock_status" -eq 0 ]; then
+      printf 'lock/install accepted a part-patched tree: %s\n' "$lock_output" >&2
+      exit 1
+    fi
+    case "$lock_output" in
+      *'only partly applied'*) ;;
       *)
-        printf 'lock/install did not report a change on an unguarded stage: %s\n' \
-          "$unguarded_output" >&2
+        printf 'lock/install refused a part-patched tree without saying why: %s\n' "$lock_output" >&2
         exit 1
         ;;
     esac
+    if [ ! -e "$tree/Service.qml.orig" ]; then
+      printf 'lock/install deleted the backup of a tree it then refused\n' >&2
+      exit 1
+    fi
+
+    # 5. A guarded tree whose FIRST candidate is corrupt, for two things at once.
+    #    · No probe may put patch's own words on this script's stdout, the stream the sync folds
+    #      into its note. A leak was found exactly here (@enterprise, #6617): the redirections read
+    #      2>&1 before >/dev/null, so stderr bound to the caller's stdout before stdout moved — and
+    #      it hid behind a successful "current".
+    #    · The run must REFUSE. A candidate that cannot be used is patch unable to answer, not an
+    #      answer about the tree, so it is loud whether the tree is guarded or not. Without this a
+    #      build reading exit 2 as "does not reverse" passes (@enterprise, #6639).
+    mkdir -p "$lock_work/corrupt/lock"
+    cp "$LEAPFROG_DIR/lock/install" "$lock_work/corrupt/lock/install"
+    cp "$LEAPFROG_DIR/lock/"*.patch "$lock_work/corrupt/lock/"
+    printf '@@ -1,BOGUS +1,3 @@\n' > "$lock_work/corrupt/lock/fingerprint-circuit-breaker.patch"
+    # ⚠️ The manifest has to be rebuilt for the corrupted copy, or the run stops at the checksum step
+    # and never reaches the exit-2 handling this case exists to test — which is what 0008 did to it
+    # (@enterprise's review, hobnob #6699).
+    ( cd "$lock_work/corrupt/lock" \
+      && sha256sum fingerprint-circuit-breaker.patch fingerprint-circuit-breaker-v1.7.patch \
+        > patch-checksums.txt )
+    tree="$(lock_tree corrupttree)"; lock_guard "$tree"
+    corrupt_status=0
+    corrupt_out="$("$lock_work/corrupt/lock/install" --plugin-dir "$tree" 2>/dev/null)" \
+      || corrupt_status=$?
+    case "$corrupt_out" in
+      *patch:*|*FAILED*|*garbage*|*ignored*)
+        printf 'lock/install leaked patch output to stdout past a probe: %s\n' "$corrupt_out" >&2
+        exit 1
+        ;;
+    esac
+    if [ "$corrupt_status" -eq 0 ]; then
+      printf 'lock/install accepted an unusable candidate patch instead of refusing: %s\n' \
+        "$corrupt_out" >&2
+      exit 1
+    fi
+
+    # 6. ⚠️ THE CASE THAT ENFORCES THE LOCK GATE, under a FAKE HOME. Without omarchy-shell the lock
+    #    state cannot be proved, and an unprovable state must be treated as locked; the build that
+    #    skipped the gate when the command was missing passed every other case (@enterprise, #6639).
+    #    The gate only engages when the target IS the live directory, so the live directory is moved
+    #    rather than the target. Pointing this at the real path instead cost a file: a mutant that
+    #    skips the gate deleted the live Service.qml.orig while the session was locked, which is the
+    #    write the gate exists to prevent.
+    gate_bin="$lock_work/gatebin"
+    mkdir -p "$gate_bin"
+    gate_tools_ok=yes
+    for gate_tool in bash patch grep realpath rm basename cat dirname ls mktemp sha256sum; do
+      gate_tool_path="$(command -v "$gate_tool" 2>/dev/null)" || { gate_tools_ok=no; break; }
+      ln -sf "$gate_tool_path" "$gate_bin/$gate_tool"
+    done
+    gate_plugin="$lock_work/gatehome/.config/omarchy/plugins/io.github.sirjul1337.lock-explorer"
+    mkdir -p "$gate_plugin"
+    cp "$lock_base/Service.qml" "$lock_base/manifest.json" "$gate_plugin/"
+    printf 'backup\n' > "$gate_plugin/Service.qml.orig"
+    gate_before="$(sha256sum < "$gate_plugin/Service.qml")"
+    gate_case() { # gate_case <label> <expected line>
+      gate_status=0
+      gate_output="$(HOME="$lock_work/gatehome" PATH="$gate_bin" "$LEAPFROG_DIR/lock/install" 2>&1)" \
+        || gate_status=$?
+      if [ "$gate_status" -ne 0 ] || [ "$gate_output" != "$2" ] \
+        || [ "$(sha256sum < "$gate_plugin/Service.qml")" != "$gate_before" ] \
+        || [ ! -e "$gate_plugin/Service.qml.orig" ]; then
+        printf 'lock/install wrote or misreported with %s: %s\n' "$1" "$gate_output" >&2
+        exit 1
+      fi
+    }
+    if [ "$gate_tools_ok" = yes ] && ! PATH="$gate_bin" command -v omarchy-shell >/dev/null 2>&1
+    then
+      gate_case "no omarchy-shell" "leapfrog-lock: deferred (lock state could not be proved safe)"
+      cat > "$gate_bin/omarchy-shell" <<'STUB'
+#!/bin/sh
+case "$2" in status) echo '{"sessionLocked":true}' ;; isLocked) echo true ;; esac
+STUB
+      chmod +x "$gate_bin/omarchy-shell"
+      gate_case "a locked session" "leapfrog-lock: deferred (the session is locked)"
+    else
+      printf 'script/check: lock-gate case SKIPPED — could not build a PATH without omarchy-shell\n' >&2
+    fi
   fi
+else
+  # A silent skip reads the same as a pass, so say plainly when the cases did not run.
+  printf 'script/check: lock-guard cases SKIPPED — no lock-explorer plugin installed\n' >&2
 fi
 
 printf 'Leapfrog checks passed.\n'
