@@ -254,9 +254,7 @@ fn action_geometry(width: u32, count: u32) -> (u32, u32) {
     let total_gap = GAP.saturating_mul(count.saturating_sub(1));
     let available = width.saturating_sub(total_gap);
     let action_width = ACTION_BUTTON_WIDTH.min(available / count);
-    let content_width = action_width
-        .saturating_mul(count)
-        .saturating_add(total_gap);
+    let content_width = action_width.saturating_mul(count).saturating_add(total_gap);
     let horizontal_margin = width.saturating_sub(content_width) / 2;
     (action_width, horizontal_margin)
 }
@@ -311,7 +309,11 @@ mod tests {
         let buttons = normal_layout(2170, 60, status());
         assert_eq!(buttons.len(), NORMAL_ACTION_COUNT as usize);
         assert!(buttons.iter().all(|button| button.action.is_some()));
-        assert!(buttons.iter().all(|button| button.rect.width == ACTION_BUTTON_WIDTH));
+        assert!(
+            buttons
+                .iter()
+                .all(|button| button.rect.width == ACTION_BUTTON_WIDTH)
+        );
         assert!(buttons.iter().all(|button| button.rect.height == 60));
         assert_eq!(buttons.first().unwrap().label, Label::Text("ESC".into()));
         assert_eq!(buttons.last().unwrap().action, Some(Action::FnToggle));

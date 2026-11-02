@@ -36,6 +36,38 @@ if [ -f "$HOME/.config/omarchy/plugins/io.github.sirjul1337.lock-explorer/Servic
   cp "$HOME/.config/omarchy/plugins/io.github.sirjul1337.lock-explorer/manifest.json" \
     "$staged_lock_test/manifest.json"
   "$LEAPFROG_DIR/lock/install" --plugin-dir "$staged_lock_test" >/dev/null
+
+  # ...and again on an UNGUARDED stage, the path the ship sync actually takes. A copy of the
+  # live tree is already guarded, so the run above takes the "current" early exit and never
+  # reaches the candidate probes. That blind spot is how a probe's "1 out of 6 hunks FAILED"
+  # reached sync-ship's note on a run that went on to succeed and exit 0 (the main machine, hobnob
+  # #6586, 2026-11-02); sync-ship folds our stdout and stderr into that note, so the normal
+  # path has to stay quiet.
+  if patch -R --forward --batch --silent -d "$staged_lock_test" -p1 \
+      < "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch" 2>/dev/null; then
+    unguarded_status=0
+    unguarded_output="$("$LEAPFROG_DIR/lock/install" --plugin-dir "$staged_lock_test" 2>&1)" \
+      || unguarded_status=$?
+    if [ "$unguarded_status" -ne 0 ]; then
+      printf 'lock/install failed on an unguarded stage (%d): %s\n' \
+        "$unguarded_status" "$unguarded_output" >&2
+      exit 1
+    fi
+    case "$unguarded_output" in
+      *FAILED*)
+        printf 'lock/install leaked a patch probe into its output: %s\n' "$unguarded_output" >&2
+        exit 1
+        ;;
+    esac
+    case "$unguarded_output" in
+      *'leapfrog-lock: changed'*) ;;
+      *)
+        printf 'lock/install did not report a change on an unguarded stage: %s\n' \
+          "$unguarded_output" >&2
+        exit 1
+        ;;
+    esac
+  fi
 fi
 
 printf 'Leapfrog checks passed.\n'

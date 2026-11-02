@@ -52,20 +52,61 @@ if ! grep -qF '"clonedFrom": "omarchy.lock"' "$PLUGIN_DIR/manifest.json" 2>/dev/
   exit 1
 fi
 
+# Each dry run is a PROBE, and a candidate that does not fit is the normal path here: the
+# pre-v1.7 patch fails 1 of its 6 hunks on a current plugin and the v1.7 one then applies.
+# patch prints that on stdout, the stream sync-ship folds into its note, so the line read as a
+# broken lock guard on a run that went on to succeed and exit 0 (the main machine, hobnob #6586,
+# 2026-11-02). Hold each probe's output instead and show it only when no candidate fits.
+#
+# Three details that are easy to get wrong here:
+#   · No --silent on the probe. Its output is captured now, so it costs nothing on the normal
+#     path, and --silent would strip the per-hunk "Hunk #N FAILED at …" lines that are the
+#     whole value of the log when nothing fits.
+#   · 2>&1 goes BEFORE the input redirection. Redirections apply left to right, so with the
+#     other order an unreadable candidate fails the input redirection first, 2>&1 never takes
+#     effect, and bash's own complaint escapes to the real stderr while the log line it belongs
+#     in comes out blank.
+#   · patch's exit codes are triaged, not merged. 1 means the hunks do not fit here, which is
+#     ordinary and stays quiet; 2 or more means patch could not use the file at all, which is a
+#     corrupt or truncated patch in the repo and has to be loud, because skipping it silently
+#     would hand a ship the wrong guard or none.
 selected_patch=""
+probe_log=""
 for candidate in \
   "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker.patch" \
   "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch"; do
-  if patch --dry-run --forward --batch --silent -d "$PLUGIN_DIR" -p1 < "$candidate"; then
-    selected_patch="$candidate"
-    break
+  # An empty file is not a patch that "applies": patch --dry-run exits 0 on one, which would
+  # select it and then report a change this script never made. A candidate that cannot be read
+  # is refused for the same reason it is refused when corrupt — skipping it quietly could hand
+  # a ship the wrong guard.
+  if [ ! -s "$candidate" ] || [ ! -r "$candidate" ]; then
+    printf 'leapfrog-lock: %s is missing, empty or unreadable\n' "$(basename "$candidate")" >&2
+    exit 1
   fi
+  probe_status=0
+  probe="$(patch --dry-run --forward --batch -d "$PLUGIN_DIR" -p1 2>&1 < "$candidate")" \
+    || probe_status=$?
+  case "$probe_status" in
+    0)
+      selected_patch="$candidate"
+      break
+      ;;
+    1)
+      probe_log="$probe_log$(basename "$candidate"):"$'\n'"${probe:-(no detail)}"$'\n'
+      ;;
+    *)
+      printf 'leapfrog-lock: %s could not be read as a patch (patch exit %s)\n%s\n' \
+        "$(basename "$candidate")" "$probe_status" "${probe:-(no detail)}" >&2
+      exit 1
+      ;;
+  esac
 done
 
 if [ -z "$selected_patch" ]; then
   printf 'leapfrog-lock: the lock plugin changed upstream; circuit-breaker patch needs review\n' >&2
+  printf '%s' "$probe_log" >&2
   exit 1
 fi
 
 patch --forward --batch --silent -d "$PLUGIN_DIR" -p1 < "$selected_patch"
-printf 'leapfrog-lock: changed (restart the shell while unlocked, or sign in again)\n'
+printf 'leapfrog-lock: changed with %s (restart the shell while unlocked, or sign in again)\n' "$(basename "$selected_patch")"
