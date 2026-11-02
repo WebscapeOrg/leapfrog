@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.6 — 2026-11-02
+
+- Stopped the lock guard's patch probe reaching the caller. `lock/install`
+  picks between the pre-v1.7 and v1.7 circuit-breaker patches by dry-running
+  each, and the first one fails a hunk on a current plugin, which is the
+  normal path. patch printed `1 out of 6 hunks FAILED` on stdout, and the
+  ship sync folds that stream into its note, so a run that applied the v1.7
+  patch and exited 0 read as a failed lock guard. Each probe's output is now
+  held back and shown, named by candidate and with every failed hunk and its
+  line, only when no candidate fits — the case where knowing what moved
+  upstream is the point. The success line names the patch it applied.
+- The guard no longer skips a candidate it could not use. patch's exit codes
+  are triaged rather than merged: hunks that do not fit stay quiet, while a
+  corrupt or truncated patch file stops the run and says so. A missing,
+  empty or unreadable candidate is refused outright, which also closes a
+  standing hole where an empty patch file dry-ran clean, was selected, and
+  the script reported a change it had not made.
+- `script/check` now also runs the guard against an unguarded stage. The
+  copy it made of the live plugin is already guarded, so the run took the
+  "current" early exit and never reached the probes, which is how the leaked
+  line went unnoticed.
+
 ## 0.2.5 — 2026-10-01
 
 - Replaced the workspace tile with a printscreen button between the
