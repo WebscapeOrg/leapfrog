@@ -1,0 +1,2 @@
+77c60a18cb2e57fe94a31d93e1bb494f46a8e5b96cd6d394a003897f56e5961e  fingerprint-circuit-breaker.patch
+1939267a86e9365e75194c61dee94a3a5ff8136f34c0ab65fdd9d50669a040d8  fingerprint-circuit-breaker-v1.7.patch

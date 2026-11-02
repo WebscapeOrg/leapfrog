@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.2.8 — 2026-11-02
+
+- Each circuit-breaker patch file is checksummed before it is used: its whole
+  `sha256sum` line must appear in `lock/patch-checksums.txt`, which also refuses
+  a candidate the manifest does not list. Handing the manifest to `sha256sum
+  --check` is not enough — without `--strict` it skips a malformed line with
+  only a warning and still exits 0, so a hash shortened by one character let a
+  truncated patch install itself. No structural test can catch a patch file cut
+  short at a hunk boundary: such a file applies cleanly and reverses cleanly,
+  so the plugin is left part-patched while every probe reports success — the
+  first three hunks of the v1.7 patch applied twice read "changed" and then
+  "current" on a tree that was never whole. The cost is deliberate: editing a
+  patch file means updating the checksum file in the same change, and
+  `script/check` fails when the two disagree.
+
+## 0.2.7 — 2026-11-02
+
+- The lock guard no longer trusts the marker alone. `fingerprintFastFailures`
+  is added by hunk 1, so a tree where that hunk applied and the other five
+  did not carried the marker while the circuit breaker was not wired up, and
+  the guard called it "current" — leaving the 250 ms PAM retry loop in place.
+  Being whole is now proved by reverse-dry-running the candidates, and a
+  part-patched tree stops the run and lists the hunks that are missing, since
+  no further forward apply would repair it.
+- Both probes triage patch's exit codes the same way. Reading every non-zero
+  exit as an answer about the tree meant a failure of patch ITSELF — an
+  unusable temporary directory, a truncated patch file — turned a wholly
+  guarded plugin into "only partly applied" and failed the ship sync. A
+  patch that cannot be used is now loud and names the file, whether the tree
+  is guarded or not; the two cases used to disagree.
+- The apply no longer leaves a backup. `--no-backup-if-mismatch` stops patch
+  writing `Service.qml.orig` beside the live plugin, which its default did on
+  every run because the hunks land at large offsets, and a leftover from an
+  earlier run is removed — including a dangling symlink, and without the
+  tidy-up ever being able to stop the guard. That removal is below the lock
+  gate on purpose, because a write to the live plugin directory while the
+  session is locked has crashed a shell before, and below the manifest check,
+  so nothing is deleted in a directory the run then refuses.
+- The apply's own output is captured and shown only when it fails. A
+  successful apply can still be chatty — a read-only `Service.qml` in a
+  writable directory draws "trying to patch anyway" — and that line in the
+  ship sync's note is the same false alarm 0.2.6 was released to stop.
+- The lock gate can no longer be walked past. Without `omarchy-shell` the
+  lock state cannot be proved, and an unprovable state is now treated as
+  locked rather than as safe; both paths are normalised before they are
+  compared, so a trailing slash on the live directory no longer makes the
+  live tree look like an inert staging copy.
+- Smaller: a plugin that is already guarded on a machine missing one of the
+  patch files now fails rather than reporting "current", because the files
+  are checked first; and an unreadable `Service.qml` is reported instead of
+  leaking grep's own error.
+- A refused tree keeps its backup. The tidy-up runs only once the run has
+  something true to report — a tree proved whole, or an apply that succeeded —
+  because deleting the backup while rejecting a part-patched plugin takes the
+  file away exactly when someone needs it. A failure to remove it is reported
+  on stderr, so a successful run's stdout stays the single line the sync reads.
+- `script/check` now also refuses to pass a guard that accepts a part-patched
+  tree, one that accepts a MARKER-ONLY tree (the only case that enforces
+  `--forward` on the reverse probe; a hunk-1-only tree is refused either way),
+  one that accepts an unusable candidate patch instead of refusing it, one that
+  does not defer when `omarchy-shell` is absent or the session is locked — read
+  as the output being exactly the deferred line, the service file's hash
+  unchanged and a planted backup still present, because a guard that prints
+  "deferred" and then patches anyway passes a weaker test — one that lets
+  patch's own words reach stdout past a probe, and one that prints anything beyond the single
+  expected line on a clean apply or on `current`. Its lock cases say plainly
+  when they are skipped, rather than passing in silence. The lock-gate case runs
+  under a fake `HOME`, so the real plugin cannot be reached by any build.
+- Smaller still: `--plugin-dir` is refused when it names nothing, and `realpath`
+  is given `--`, so neither an empty nor a dash-leading path leaks realpath's
+  own error; and a
+  patch that cannot be used says so without blaming the patch file, since an
+  unusable temporary directory lands there too.
+
 ## 0.2.6 — 2026-11-02
 
 - Stopped the lock guard's patch probe reaching the caller. `lock/install`

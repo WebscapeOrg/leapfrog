@@ -11,16 +11,36 @@ if [ "${1:-}" = "--plugin-dir" ]; then
     exit 2
   }
   PLUGIN_DIR="$2"
+  # realpath prints its own "realpath: '': No such file or directory" for an empty path, which is
+  # exactly the raw-output leak this guard exists to avoid (the machine agent's review, hobnob #6699).
+  if [ -z "$PLUGIN_DIR" ]; then
+    printf '%s: --plugin-dir needs a directory\n' "$0" >&2
+    exit 2
+  fi
 elif [ "$#" -ne 0 ]; then
   printf 'usage: %s [--plugin-dir DIR]\n' "$0" >&2
   exit 2
 fi
 
+# ⚠️ Both paths are normalised before anything compares them. The comparison below decides whether
+# the lock gate applies, so a spelling of the live tree that does not match it literally — a
+# trailing slash, a doubled separator, a symlinked parent — would walk straight past the gate and
+# write to the live plugin while the session might be locked.
+PLUGIN_DIR="$(realpath -m -- "$PLUGIN_DIR")"
+LIVE_PLUGIN_DIR="$(realpath -m -- "$LIVE_PLUGIN_DIR")"
+
 SERVICE="$PLUGIN_DIR/Service.qml"
 
 # A custom directory is an inert staging tree, not the live QML tree. the main machine
 # uses this form to guard the exact marketplace copy before it crosses ships.
-if [ "$PLUGIN_DIR" = "$LIVE_PLUGIN_DIR" ] && command -v omarchy-shell >/dev/null 2>&1; then
+if [ "$PLUGIN_DIR" = "$LIVE_PLUGIN_DIR" ]; then
+  # ⚠️ No omarchy-shell means the lock state cannot be proved, and an unprovable state is treated
+  # as locked, not as safe. Writing to the live plugin dir while the session is locked crashed a
+  # shell on 2026-08-18, and this script used to skip the whole gate when the command was missing.
+  if ! command -v omarchy-shell >/dev/null 2>&1; then
+    printf 'leapfrog-lock: deferred (lock state could not be proved safe)\n'
+    exit 0
+  fi
   lock_status="$(omarchy-shell lock status 2>/dev/null || true)"
   case "$lock_status" in
     *'"sessionLocked":true'*|*'"pending":true'*)
@@ -42,13 +62,125 @@ if [ ! -f "$SERVICE" ]; then
   exit 0
 fi
 
-if grep -qF 'property int fingerprintFastFailures' "$SERVICE"; then
-  printf 'leapfrog-lock: current\n'
-  exit 0
+# Checked rather than left to grep: an unreadable service file otherwise leaks grep's own
+# "Permission denied" to the caller, which is the raw-output leak this guard exists to avoid.
+if [ ! -r "$SERVICE" ]; then
+  printf 'leapfrog-lock: %s cannot be read\n' "$SERVICE" >&2
+  exit 1
 fi
 
+CANDIDATES=(
+  "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker.patch"
+  "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch"
+)
+
+# A candidate that cannot be read is not a candidate. patch --dry-run exits 0 on an EMPTY file,
+# which would select it, make the apply a no-op and still report a change, so size is checked too.
+# ⚠️ This runs before the "current" check, so a plugin that is already guarded on a machine whose
+# copy of a candidate has gone missing now fails here rather than reporting "current".
+for candidate in "${CANDIDATES[@]}"; do
+  if [ ! -s "$candidate" ] || [ ! -r "$candidate" ]; then
+    printf 'leapfrog-lock: %s is missing, empty or unreadable\n' "$(basename "$candidate")" >&2
+    exit 1
+  fi
+done
+
+# ⚠️ EVERY CANDIDATE IS CHECKSUMMED BEFORE IT IS USED, because no structural test can catch a patch
+# file that was cut short at a hunk boundary: such a file applies cleanly AND reverses cleanly, so
+# the tree is left part-patched while every probe here reports success — hunks 1-3 of v1.7 applied
+# twice reads "changed" and then "current", exit 0 (the machine agent's review, hobnob #6639; the fix
+# approved in #6670). The cost is deliberate: editing a patch file means updating
+# lock/patch-checksums.txt in the same change, and script/check fails if the two disagree.
+# ⚠️ Each candidate's line is matched WHOLE, rather than handing the manifest to
+# `sha256sum --check`. Without --strict that command skips a malformed line with only a warning and
+# still exits 0, so a manifest hash shortened to 63 characters let a patch file truncated at a hunk
+# boundary install itself — "changed", then "current", both exit 0, on a part-patched tree
+# (the machine agent's review, hobnob #6699). Matching the line also refuses a candidate the manifest does
+# not list at all, and one written with a separator that is not sha256sum's own.
+if ! command -v sha256sum >/dev/null 2>&1; then
+  printf 'leapfrog-lock: sha256sum is missing, so the patch files cannot be verified\n' >&2
+  exit 1
+fi
+for candidate in "${CANDIDATES[@]}"; do
+  candidate_name="$(basename "$candidate")"
+  candidate_line=""
+  candidate_line="$( (cd "$LEAPFROG_DIR/lock" && sha256sum -- "$candidate_name") 2>/dev/null )" \
+    || candidate_line=""
+  if [ -z "$candidate_line" ] || ! grep -qxF -- "$candidate_line" \
+      "$LEAPFROG_DIR/lock/patch-checksums.txt" 2>/dev/null; then
+    printf 'leapfrog-lock: %s does not match its line in lock/patch-checksums.txt\n' \
+      "$candidate_name" >&2
+    exit 1
+  fi
+done
+
+# ⚠️ Ahead of both the tidy-up and the "current" check on purpose: this script should neither
+# delete anything in, nor vouch for, a plugin directory it is about to refuse as unrecognised.
 if ! grep -qF '"clonedFrom": "omarchy.lock"' "$PLUGIN_DIR/manifest.json" 2>/dev/null; then
   printf 'leapfrog-lock: refusing to patch an unrecognised lock service\n' >&2
+  exit 1
+fi
+
+# A backup left by an earlier apply, from patch's backup-if-mismatch default that the apply below
+# now disables. -L as well as -e, because a dangling symlink is a leftover too, and a failure to
+# remove it must not stop the guard — tidying is the least important thing this script does, so its
+# complaint goes to stderr and a successful run's stdout stays the line the ship sync reads.
+#
+# ⚠️ CALLED ONLY FROM THE TWO SUCCESS PATHS, and never before the lock gate. Below the gate because
+# a write to the live plugin dir while the session is locked crashed a shell on 2026-08-18; only on
+# success because a REFUSED tree must keep its backup — deleting it while rejecting a part-patched
+# plugin takes the file away exactly when someone needs it (the machine agent's reviews, hobnob #6603
+# and #6639).
+remove_leftover_backup() {
+  [ -e "$SERVICE.orig" ] || [ -L "$SERVICE.orig" ] || return 0
+  if rm -f "$SERVICE.orig" 2>/dev/null; then
+    printf 'leapfrog-lock: removed a leftover %s.orig\n' "$(basename "$SERVICE")"
+  else
+    printf 'leapfrog-lock: could not remove the leftover %s.orig; left in place\n' \
+      "$(basename "$SERVICE")" >&2
+  fi
+}
+
+# ⚠️ THE MARKER ALONE DOES NOT MEAN GUARDED. `fingerprintFastFailures` is added by hunk 1, so a tree
+# where hunk 1 applied and the other five did not carries the marker while the circuit breaker is
+# not actually wired up — and the old check reported that as "current", leaving the 250 ms PAM retry
+# loop in place (the machine agent, hobnob #6603). Being whole is proved instead by reverse-dry-running
+# the candidates: a tree that reverses cleanly is one some candidate fully applied.
+#
+# ⚠️ --forward is required, not decoration. Without it patch meets a reverse patch that does not
+# fit, decides it must have been handed a reversed patch, and applies it FORWARD instead — so a
+# wholly unguarded tree reverse-dry-runs clean and would be reported as "current". Measured
+# 2026-11-02: unguarded-plus-marker exits 0 without --forward and 1 with it.
+#
+# ⚠️ The exit codes are triaged exactly as the forward probe triages them, and for the same reason.
+# Reading every non-zero exit as "does not reverse" meant that any failure of patch ITSELF — an
+# unusable TMPDIR, a truncated candidate — turned a wholly guarded tree into "only partly applied"
+# and failed the ship sync (the machine agent's review, hobnob #6624). 1 is an answer about the tree; 2
+# and above is patch unable to answer, which is loud and names the file.
+if grep -qF 'property int fingerprintFastFailures' "$SERVICE"; then
+  reverse_log=""
+  for candidate in "${CANDIDATES[@]}"; do
+    reverse_status=0
+    reverse="$(patch --reverse --dry-run --forward --batch -d "$PLUGIN_DIR" -p1 2>&1 \
+      < "$candidate")" || reverse_status=$?
+    case "$reverse_status" in
+      0)
+        remove_leftover_backup
+        printf 'leapfrog-lock: current\n'
+        exit 0
+        ;;
+      1)
+        reverse_log="$reverse_log$(basename "$candidate"):"$'\n'"${reverse:-(no detail)}"$'\n'
+        ;;
+      *)
+        printf 'leapfrog-lock: %s could not be used (patch exit %s; the patch file, or patch itself)\n%s\n' \
+          "$(basename "$candidate")" "$reverse_status" "${reverse:-(no detail)}" >&2
+        exit 1
+        ;;
+    esac
+  done
+  printf 'leapfrog-lock: the guard is only partly applied; the lock service needs review\n' >&2
+  printf '%s' "$reverse_log" >&2
   exit 1
 fi
 
@@ -58,31 +190,20 @@ fi
 # broken lock guard on a run that went on to succeed and exit 0 (the main machine, hobnob #6586,
 # 2026-11-02). Hold each probe's output instead and show it only when no candidate fits.
 #
-# Three details that are easy to get wrong here:
+# Two details that are easy to get wrong here:
 #   · No --silent on the probe. Its output is captured now, so it costs nothing on the normal
 #     path, and --silent would strip the per-hunk "Hunk #N FAILED at …" lines that are the
 #     whole value of the log when nothing fits.
-#   · 2>&1 goes BEFORE the input redirection. Redirections apply left to right, so with the
-#     other order an unreadable candidate fails the input redirection first, 2>&1 never takes
-#     effect, and bash's own complaint escapes to the real stderr while the log line it belongs
-#     in comes out blank.
-#   · patch's exit codes are triaged, not merged. 1 means the hunks do not fit here, which is
-#     ordinary and stays quiet; 2 or more means patch could not use the file at all, which is a
-#     corrupt or truncated patch in the repo and has to be loud, because skipping it silently
-#     would hand a ship the wrong guard or none.
+#   · 2>&1 goes BEFORE the input redirection, in both probes. Redirections apply left to right,
+#     so with the other order an unreadable candidate fails the input redirection first, 2>&1
+#     never takes effect, and bash's own complaint escapes to the real stderr while the log line
+#     it belongs in comes out blank. (Getting this backwards the other way round — 2>&1 before a
+#     >/dev/null meant to silence a probe — put patch's errors on this script's stdout behind a
+#     successful "current"; the machine agent, hobnob #6617. Capturing avoids the question entirely,
+#     which is why both probes now capture.)
 selected_patch=""
 probe_log=""
-for candidate in \
-  "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker.patch" \
-  "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch"; do
-  # An empty file is not a patch that "applies": patch --dry-run exits 0 on one, which would
-  # select it and then report a change this script never made. A candidate that cannot be read
-  # is refused for the same reason it is refused when corrupt — skipping it quietly could hand
-  # a ship the wrong guard.
-  if [ ! -s "$candidate" ] || [ ! -r "$candidate" ]; then
-    printf 'leapfrog-lock: %s is missing, empty or unreadable\n' "$(basename "$candidate")" >&2
-    exit 1
-  fi
+for candidate in "${CANDIDATES[@]}"; do
   probe_status=0
   probe="$(patch --dry-run --forward --batch -d "$PLUGIN_DIR" -p1 2>&1 < "$candidate")" \
     || probe_status=$?
@@ -95,7 +216,7 @@ for candidate in \
       probe_log="$probe_log$(basename "$candidate"):"$'\n'"${probe:-(no detail)}"$'\n'
       ;;
     *)
-      printf 'leapfrog-lock: %s could not be read as a patch (patch exit %s)\n%s\n' \
+      printf 'leapfrog-lock: %s could not be used (patch exit %s; the patch file, or patch itself)\n%s\n' \
         "$(basename "$candidate")" "$probe_status" "${probe:-(no detail)}" >&2
       exit 1
       ;;
@@ -103,10 +224,24 @@ for candidate in \
 done
 
 if [ -z "$selected_patch" ]; then
-  printf 'leapfrog-lock: the lock plugin changed upstream; circuit-breaker patch needs review\n' >&2
+  printf 'leapfrog-lock: the lock plugin changed upstream, or is part-patched; needs review\n' >&2
   printf '%s' "$probe_log" >&2
   exit 1
 fi
 
-patch --forward --batch --silent -d "$PLUGIN_DIR" -p1 < "$selected_patch"
+# The apply is held to the same rule as the probes. --no-backup-if-mismatch stops patch leaving a
+# Service.qml.orig beside the live plugin, which its backup-on-offset default did on every run (the
+# hunks land at large offsets). Its output is captured and shown only when it fails: a successful
+# apply can still be chatty — with Service.qml at 0444 and the directory writable patch prints
+# "File Service.qml is read-only; trying to patch anyway" and succeeds — and that line in the ship
+# sync's note is the same false alarm this guard was fixed for (the machine agent, hobnob #6603).
+apply_status=0
+apply_output="$(patch --forward --batch --no-backup-if-mismatch -d "$PLUGIN_DIR" -p1 2>&1 \
+  < "$selected_patch")" || apply_status=$?
+if [ "$apply_status" -ne 0 ]; then
+  printf 'leapfrog-lock: applying %s failed (patch exit %s)\n%s\n' \
+    "$(basename "$selected_patch")" "$apply_status" "${apply_output:-(no detail)}" >&2
+  exit 1
+fi
+remove_leftover_backup
 printf 'leapfrog-lock: changed with %s (restart the shell while unlocked, or sign in again)\n' "$(basename "$selected_patch")"
