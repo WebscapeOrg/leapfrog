@@ -101,6 +101,15 @@ if ! command -v sha256sum >/dev/null 2>&1; then
   printf 'leapfrog-lock: sha256sum is missing, so the patch files cannot be verified\n' >&2
   exit 1
 fi
+# ⚠️ Checked before the loop below reads it. The loop redirects the manifest into `while read`, and
+# a missing or unreadable file there is reported by BASH — "install: line N: …: No such file or
+# directory", with no leapfrog-lock: prefix and the full path — straight into the ship sync's note.
+# The grep this replaced in 0010 swallowed that with 2>/dev/null (the machine agent, hobnob #6726).
+if [ ! -r "$LEAPFROG_DIR/lock/patch-checksums.txt" ]; then
+  printf 'leapfrog-lock: lock/patch-checksums.txt is missing or unreadable\n' >&2
+  exit 1
+fi
+
 for candidate in "${CANDIDATES[@]}"; do
   candidate_name="$(basename "$candidate")"
   candidate_line=""
@@ -122,9 +131,16 @@ for candidate in "${CANDIDATES[@]}"; do
         ;;
     esac
   done < "$LEAPFROG_DIR/lock/patch-checksums.txt"
-  if [ -z "$candidate_line" ] || [ "$manifest_hits" -ne 1 ] || [ "$manifest_match" != yes ]; then
-    printf 'leapfrog-lock: %s has %s matching line(s) in lock/patch-checksums.txt, expected one\n' \
+  # Two different faults, two different sentences: one line saying "has 1 matching line(s) …
+  # expected one" for a file whose hash simply differs reads as a contradiction (the machine agent,
+  # hobnob #6726).
+  if [ "$manifest_hits" -ne 1 ]; then
+    printf 'leapfrog-lock: lock/patch-checksums.txt names %s %s times, expected once\n' \
       "$candidate_name" "$manifest_hits" >&2
+    exit 1
+  fi
+  if [ -z "$candidate_line" ] || [ "$manifest_match" != yes ]; then
+    printf 'leapfrog-lock: %s does not match its recorded checksum\n' "$candidate_name" >&2
     exit 1
   fi
 done

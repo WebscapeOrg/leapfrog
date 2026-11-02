@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.10 — 2026-11-02
+
+- A missing or unreadable `lock/patch-checksums.txt` is reported by the guard
+  rather than by bash. Reading the manifest with `while read` left bash to
+  announce it — full path, no `leapfrog-lock:` prefix — into the ship sync's
+  note, which is the kind of raw output the guard exists to keep out of it. The
+  grep this replaced in 0.2.9 had swallowed that with a redirection.
+- A patch file whose checksum simply differs no longer says "has 1 matching
+  line(s) … expected one", which read as a contradiction. A manifest that names
+  a file the wrong number of times and a file that does not match its recorded
+  checksum are now two sentences.
+
 ## 0.2.9 — 2026-11-02
 
 - The checksum manifest must name each patch file exactly once. Matching a
