@@ -106,10 +106,25 @@ for candidate in "${CANDIDATES[@]}"; do
   candidate_line=""
   candidate_line="$( (cd "$LEAPFROG_DIR/lock" && sha256sum -- "$candidate_name") 2>/dev/null )" \
     || candidate_line=""
-  if [ -z "$candidate_line" ] || ! grep -qxF -- "$candidate_line" \
-      "$LEAPFROG_DIR/lock/patch-checksums.txt" 2>/dev/null; then
-    printf 'leapfrog-lock: %s does not match its line in lock/patch-checksums.txt\n' \
-      "$candidate_name" >&2
+  # ⚠️ EXACTLY ONE line may name this candidate, and it must be the matching one. A whole-line grep
+  # alone is satisfied by ANY matching line, so a manifest listing a candidate twice — the right
+  # hash and a truncated file's hash, which is what `sha256sum *.patch >> patch-checksums.txt`
+  # produces — let the truncated patch install (@enterprise's review, hobnob #6720). Counted with a
+  # case glob rather than grep so the name is matched literally and only at the end of the line,
+  # with no shell tool beyond bash's own builtins.
+  manifest_hits=0
+  manifest_match=no
+  while IFS= read -r manifest_line || [ -n "$manifest_line" ]; do
+    case "$manifest_line" in
+      *"  $candidate_name")
+        manifest_hits=$((manifest_hits + 1))
+        [ "$manifest_line" = "$candidate_line" ] && manifest_match=yes
+        ;;
+    esac
+  done < "$LEAPFROG_DIR/lock/patch-checksums.txt"
+  if [ -z "$candidate_line" ] || [ "$manifest_hits" -ne 1 ] || [ "$manifest_match" != yes ]; then
+    printf 'leapfrog-lock: %s has %s matching line(s) in lock/patch-checksums.txt, expected one\n' \
+      "$candidate_name" "$manifest_hits" >&2
     exit 1
   fi
 done

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.9 — 2026-11-02
+
+- The checksum manifest must name each patch file exactly once. Matching a
+  whole line is satisfied by any matching line, so a manifest listing a
+  candidate twice — the right hash and a truncated file's hash, which is what
+  appending `sha256sum` output to the file produces — let the truncated patch
+  install itself and delete the backup. Only an unchecked manifest edit could
+  reach it, since `script/check` fails such a file, but it was reachable.
+- `script/check` runs its corrupt-candidate case against an unguarded tree as
+  well as a guarded one, so the forward probe is covered there and not only
+  the reverse one.
+- Corrects 0.2.7: the claim that `script/check` refuses a guard letting patch's
+  own words reach stdout past a probe held for the reverse probe only, because
+  that case built a guarded tree and nothing else.
+
 ## 0.2.8 — 2026-11-02
 
 - Each circuit-breaker patch file is checksummed before it is used: its whole
