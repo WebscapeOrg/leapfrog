@@ -87,6 +87,30 @@ if [ -f "$lock_plugin/Service.qml" ]; then
       fi
     done
 
+    # 0b. A manifest may name a candidate only ONCE. A whole-line match is satisfied by ANY
+    #     matching line, so a duplicate — the right hash plus a truncated file's, which is what
+    #     appending sha256sum output produces — let the truncated patch install and deleted the
+    #     backup (the machine agent's review, hobnob #6720). Built in a copy, because the --strict
+    #     comparison above would reject such a manifest in the repo itself.
+    mkdir -p "$lock_work/dup/lock"
+    cp "$LEAPFROG_DIR/lock/install" "$lock_work/dup/lock/install"
+    cp "$LEAPFROG_DIR/lock/"*.patch "$lock_work/dup/lock/"
+    cp "$LEAPFROG_DIR/lock/patch-checksums.txt" "$lock_work/dup/lock/patch-checksums.txt"
+    awk '/^@@/ { hunks++ } hunks < 4 { print } hunks >= 4 { exit }' \
+      "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch" \
+      > "$lock_work/dup/lock/fingerprint-circuit-breaker-v1.7.patch"
+    ( cd "$lock_work/dup/lock" \
+      && sha256sum fingerprint-circuit-breaker-v1.7.patch >> patch-checksums.txt )
+    tree="$(lock_tree dupmanifest)"
+    printf 'backup\n' > "$tree/Service.qml.orig"
+    dup_status=0
+    dup_out="$("$lock_work/dup/lock/install" --plugin-dir "$tree" 2>&1)" || dup_status=$?
+    if [ "$dup_status" -eq 0 ] || [ ! -e "$tree/Service.qml.orig" ] \
+      || grep -qF 'property int fingerprintFastFailures' "$tree/Service.qml"; then
+      printf 'lock/install accepted a manifest naming a candidate twice: %s\n' "$dup_out" >&2
+      exit 1
+    fi
+
     # 1. A guarded tree reports exactly one line. Not a substring: the ship sync's note is this
     #    whole stream, so one extra line is one false alarm.
     tree="$(lock_tree guarded)"; lock_guard "$tree"; lock_run "$tree"
@@ -181,21 +205,28 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     ( cd "$lock_work/corrupt/lock" \
       && sha256sum fingerprint-circuit-breaker.patch fingerprint-circuit-breaker-v1.7.patch \
         > patch-checksums.txt )
-    tree="$(lock_tree corrupttree)"; lock_guard "$tree"
-    corrupt_status=0
-    corrupt_out="$("$lock_work/corrupt/lock/install" --plugin-dir "$tree" 2>/dev/null)" \
-      || corrupt_status=$?
-    case "$corrupt_out" in
-      *patch:*|*FAILED*|*garbage*|*ignored*)
-        printf 'lock/install leaked patch output to stdout past a probe: %s\n' "$corrupt_out" >&2
+    # ⚠️ BOTH tree states. A guarded tree reaches the REVERSE probe and an unguarded one the
+    # FORWARD probe, so testing only the guarded tree leaves the forward probe's redirections
+    # uncovered here (the machine agent's review, hobnob #6720).
+    for corrupt_state in guarded unguarded; do
+      tree="$(lock_tree "corrupt-$corrupt_state")"
+      [ "$corrupt_state" = guarded ] && lock_guard "$tree"
+      corrupt_status=0
+      corrupt_out="$("$lock_work/corrupt/lock/install" --plugin-dir "$tree" 2>/dev/null)" \
+        || corrupt_status=$?
+      case "$corrupt_out" in
+        *patch:*|*FAILED*|*garbage*|*ignored*)
+          printf 'lock/install leaked patch output to stdout past a probe (%s tree): %s\n' \
+            "$corrupt_state" "$corrupt_out" >&2
+          exit 1
+          ;;
+      esac
+      if [ "$corrupt_status" -eq 0 ]; then
+        printf 'lock/install accepted an unusable candidate patch (%s tree): %s\n' \
+          "$corrupt_state" "$corrupt_out" >&2
         exit 1
-        ;;
-    esac
-    if [ "$corrupt_status" -eq 0 ]; then
-      printf 'lock/install accepted an unusable candidate patch instead of refusing: %s\n' \
-        "$corrupt_out" >&2
-      exit 1
-    fi
+      fi
+    done
 
     # 6. ⚠️ THE CASE THAT ENFORCES THE LOCK GATE, under a FAKE HOME. Without omarchy-shell the lock
     #    state cannot be proved, and an unprovable state must be treated as locked; the build that
