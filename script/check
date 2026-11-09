@@ -76,9 +76,15 @@ if [ -f "$lock_plugin/Service.qml" ]; then
       cp "$lock_base/Service.qml" "$lock_base/manifest.json" "$lock_work/$1/"
       printf '%s\n' "$lock_work/$1"
     }
-    lock_guard() { # lock_guard <dir> — apply the v1.7 guard, quietly
-      patch --forward --batch --silent --no-backup-if-mismatch -d "$1" -p1 \
-        < "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch" >/dev/null 2>&1
+    lock_guard() { # lock_guard <dir> — apply the newest guard, quietly
+      # ⚠️ The check, not just the patch. Under set -e with the output thrown away, a guard that no
+      # longer fits the local plugin ended this script with exit 1 and no message at all
+      # (the machine agent, hobnob #10079).
+      if ! patch --forward --batch --silent --no-backup-if-mismatch -d "$1" -p1 \
+        < "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch" >/dev/null 2>&1; then
+        printf 'script/check: the newest guard no longer applies to the local lock plugin\n' >&2
+        exit 1
+      fi
       rm -f "$1"/*.orig "$1"/*.rej
     }
     lock_run() { # lock_run <dir> — stdout+stderr of the guard, status in lock_status
@@ -181,9 +187,18 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     #     guard reaches that machine. A build that reports "current" for any whole guard leaves those
     #     machines on the old one for good — which is how the wake-from-sleep fault would have
     #     survived its own fix (@leapfrog, 2026-11-02 sleep tests).
+    #
+    #     ⚠️ THE ORIGINAL GUARD'S FIXTURE IS A PINNED COMMIT, NOT HEAD. HEAD is whatever this machine
+    #     last pulled, and 1 of the original guard's 6 hunks fails on the plugin's v2.0.9, so this
+    #     case passed on the MacBook (HEAD at v1.5.5) and failed on the main machine (HEAD at v2.0.9) with the
+    #     same code (the machine agent, hobnob #10079). The guard applies cleanly to this commit, and both
+    #     machines hold it.
+    lock_original_guard_commit=08c454f6ea35d5be562ccd6f25ce7a3528dd8999
     original_tree="$(lock_tree older-fingerprint-circuit-breaker)"
-    if ! git -C "$lock_plugin" show HEAD:Service.qml > "$original_tree/Service.qml"; then
-      printf 'script/check: cannot build the original guard fixture from the plugin history\n' >&2
+    if ! git -C "$lock_plugin" show "$lock_original_guard_commit:Service.qml" \
+      > "$original_tree/Service.qml"; then
+      printf 'script/check: the lock plugin history lacks commit %s, the original guard fixture\n' \
+        "$lock_original_guard_commit" >&2
       exit 1
     fi
     for older in "$LEAPFROG_DIR/lock/"fingerprint-circuit-breaker*.patch; do
@@ -283,8 +298,11 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     tree="$(lock_tree hunk1only)"
     awk '/^@@/ { hunks++ } hunks < 2 { print } hunks >= 2 { exit }' \
       "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch" > "$lock_work/hunk1.patch"
-    patch --forward --batch --silent --no-backup-if-mismatch -d "$tree" -p1 \
-      < "$lock_work/hunk1.patch" >/dev/null 2>&1
+    if ! patch --forward --batch --silent --no-backup-if-mismatch -d "$tree" -p1 \
+      < "$lock_work/hunk1.patch" >/dev/null 2>&1; then
+      printf 'script/check: could not build a hunk-1-only tree; the first hunk no longer applies\n' >&2
+      exit 1
+    fi
     rm -f "$tree"/*.orig "$tree"/*.rej
     cp "$tree/Service.qml" "$tree/Service.qml.orig"
     lock_run "$tree"

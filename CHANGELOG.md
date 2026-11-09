@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.12 — 2026-11-09
+
+- `script/check` gives the same answer on every machine. Its fixture for the
+  original fingerprint guard came from the lock plugin's `HEAD`, which is
+  whatever that machine last pulled: the MacBook's stops at 1.5.5 and the case
+  passed, the main machine's is at 2.0.9, where one of the guard's six hunks no longer
+  applies, and the case failed before it tested anything. The fixture now comes
+  from plugin commit `08c454f`, which the guard applies to and both machines
+  hold.
+- A guard that no longer fits the local plugin is now reported. Two `patch`
+  calls ran with their output discarded under `set -e`, so `script/check`
+  stopped with exit 1 and no message.
+
 ## 0.2.11 — 2026-11-09
 
 - Touch ID comes back after a wake. The fingerprint circuit breaker latched for
