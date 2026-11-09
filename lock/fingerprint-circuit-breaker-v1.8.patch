@@ -1,0 +1,123 @@
+diff --git a/tmp/leapfrog-0012-qml-GCuzsP/base/Service.qml b/tmp/leapfrog-0012-qml-GCuzsP/modified/Service.qml
+index 0be8d97..d53e260 100644
+--- a/Service.qml
++++ b/Service.qml
+@@ -2840,6 +2840,15 @@ echo "$out"
+   property bool pendingSessionLock: false
+   property bool authenticatingPassword: false
+   property bool fingerprintAuthenticating: false
++  // A broken fingerprint service must not become an unbounded PAM loop. A
++  // normal rejected scan takes long enough to reset this streak; an immediate
++  // service failure opens the circuit for this lock and leaves password auth.
++  property int fingerprintFastFailures: 0
++  property double fingerprintStartedAt: 0
++  property bool fingerprintPaused: false
++  property double fingerprintPausedAt: 0
++  property int fingerprintCooldown: 15000
++  property int fingerprintActiveCooldown: 15000
+   property bool faceAuthenticating: false
+   // Face retries on its own after a miss, but not forever: a camera that
+   // errors out at once would otherwise spin the PAM stack four times a
+@@ -3199,6 +3208,12 @@ echo "$out"
+     fido2FailurePending = false
+     authenticatingPassword = false
+     fingerprintAuthenticating = false
++    fingerprintFastFailures = 0
++    fingerprintStartedAt = 0
++    fingerprintPaused = false
++    fingerprintPausedAt = 0
++    fingerprintCooldown = 15000
++    fingerprintActiveCooldown = 15000
+     fingerprintRetryTimer.stop()
+     clearFingerprintStatus()
+     faceMisses = 0
+@@ -3406,15 +3421,62 @@ echo "$out"
+   }
+
+   function startFingerprint() {
++    // An open circuit is a cooldown, not a verdict. Only the retry timer armed in
++    // scheduleFingerprintRetry reaches here while paused, and only once the cooldown has elapsed on
++    // the WALL CLOCK -- which also covers a suspend, the way idleBlankTimer reads a sleep from the
++    // gap rather than from an event, since this service subscribes to nothing from logind.
++    if (fingerprintPaused) {
++      if (Date.now() - fingerprintPausedAt < fingerprintActiveCooldown) return
++      fingerprintPaused = false
++      logEvent("fingerprint-resumed: cooldown elapsed")
++    }
+     if (!lockRequested || !sessionLock.secure || !fingerprintConfigured) return
+     if (fingerprintPam.active || fingerprintAuthenticating) return
+
+     fingerprintAuthenticating = true
++    fingerprintStartedAt = Date.now()
+     if (!fingerprintPam.start()) {
+       fingerprintAuthenticating = false
++      scheduleFingerprintRetry()
+     }
+   }
+
++  function scheduleFingerprintRetry() {
++    if (!lockRequested || !fingerprintConfigured || fingerprintPaused) return
++
++    var elapsed = fingerprintStartedAt > 0 ? Date.now() - fingerprintStartedAt : 0
++    if (elapsed < 1000) {
++      fingerprintFastFailures += 1
++      if (fingerprintFastFailures >= 3) {
++        // OPEN, NOT LATCHED. A wake restarts fprintd (the system-sleep hook for libfprint#173)
++        // under a PAM conversation that began before the sleep, so the first failure reads
++        // "fprintd name owner changed during operation" and the retries meet a T1 that is still
++        // resetting: three fast failures about 3 s after EVERY wake. Latching here switched Touch
++        // ID off for the rest of the lock although the broker recovered seconds later, so a lid
++        // open cost the fingerprint reader until the next unlock (@leapfrog, from the 2026-11-02
++        // sleep tests; the same shape as t1bridge-keybag's restart storm that morning). The loop
++        // this guard exists to stop is still stopped -- at most one attempt per cooldown, doubling
++        // to a minute -- but the circuit closes again on its own once the service is back.
++        fingerprintPaused = true
++        fingerprintPausedAt = Date.now()
++        fingerprintActiveCooldown = fingerprintCooldown
++        logEvent("fingerprint-paused: repeated-service-errors, retrying in "
++          + Math.round(fingerprintCooldown / 1000) + "s")
++        fingerprintRetryTimer.interval = fingerprintActiveCooldown
++        fingerprintCooldown = Math.min(fingerprintCooldown * 2, 60000)
++        fingerprintRetryTimer.restart()
++        return
++      }
++      fingerprintRetryTimer.interval = 1000 * Math.pow(2, fingerprintFastFailures - 1)
++    } else {
++      fingerprintFastFailures = 0
++      fingerprintCooldown = 15000
++      fingerprintRetryTimer.interval = 250
++    }
++
++    fingerprintRetryTimer.restart()
++  }
++
+   function handleFingerprintFinished(result) {
+     fingerprintAuthenticating = false
+
+@@ -3422,7 +3484,7 @@ echo "$out"
+     if (result === PamResult.Success) {
+       finishUnlock()
+     } else if (fingerprintConfigured) {
+-      fingerprintRetryTimer.restart()
++      scheduleFingerprintRetry()
+     }
+   }
+
+@@ -3951,7 +4013,7 @@ echo "$out"
+
+     onError: function(error) {
+       root.fingerprintAuthenticating = false
+-      if (root.lockRequested && root.fingerprintConfigured) fingerprintRetryTimer.restart()
++      root.scheduleFingerprintRetry()
+     }
+   }
+
+@@ -4263,7 +4325,7 @@ echo "$out"
+
+   Process {
+     id: fingerprintCheckProc
+-    command: ["bash", "-c", "if [[ -f /etc/pam.d/omarchy-lock-fingerprint ]] && command -v fprintd-list >/dev/null 2>&1 && fprintd-list \"$USER\" 2>/dev/null | grep -qi finger; then echo yes; else echo no; fi"]
++    command: ["bash", "-c", "if [[ -f /etc/pam.d/omarchy-lock-fingerprint ]] && systemctl --quiet is-active t1bridge-keybag.service && command -v fprintd-list >/dev/null 2>&1 && fprintd-list \"$USER\" 2>/dev/null | grep -qi finger; then echo yes; else echo no; fi"]
+     stdout: StdioCollector { id: fingerprintCheckStdout; waitForEnd: true }
+     onExited: {
+       root.fingerprintConfigured = String(fingerprintCheckStdout.text || "").trim() === "yes"

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.11 — 2026-11-09
+
+- Touch ID comes back after a wake. The fingerprint circuit breaker latched for
+  the rest of the lock, and a wake trips it every time: the system-sleep hook
+  restarts fprintd under a PAM conversation that began before the sleep, so the
+  first failure reads "fprintd name owner changed during operation" and the
+  retries meet a T1 that is still resetting — three fast failures about three
+  seconds after every wake. The breaker now opens for a cooldown instead of
+  latching: fifteen seconds, doubling to a minute, cleared by a service that
+  answers properly again. The unbounded PAM loop it exists to stop is still
+  stopped, at most one attempt per cooldown, but the circuit closes on its own
+  once the service is back. Password unlock was never affected.
+- The guard can upgrade a plugin that already carries an older guard. The new
+  breaker ships as a third candidate rather than a rewrite of the second,
+  because rewriting one in place leaves every machine holding it with the
+  marker present and nothing that reverses — which reads as part-patched and
+  stops the whole ship sync. A whole but superseded guard is now reversed and
+  replaced with the newest, reported as "upgrading from <patch>".
+- `script/check` derives its unguarded base from whichever candidate the local
+  plugin carries rather than assuming one, and refuses a guard that reports
+  "current" for an older candidate instead of upgrading it.
+
 ## 0.2.10 — 2026-11-02
 
 - A missing or unreadable `lock/patch-checksums.txt` is reported by the guard

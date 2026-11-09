@@ -69,10 +69,18 @@ if [ ! -r "$SERVICE" ]; then
   exit 1
 fi
 
+# ⚠️ NEWEST FIRST, AND NOTHING IS EVER DROPPED FROM THIS LIST. The first entry is what an unguarded
+# plugin is given and what an older guard is upgraded to; every other entry earns its place by being
+# a guard some machine may already carry, because reversing it is the only way to upgrade that
+# machine. Delete one, or rewrite one in place, and every plugin holding it reads as part-patched:
+# the marker is there, nothing reverses, and the run refuses — which stops the whole ship sync, not
+# just the guard (measured 2026-11-09, before the upgrade path below existed).
 CANDIDATES=(
-  "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker.patch"
+  "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch"
   "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch"
+  "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker.patch"
 )
+PREFERRED="${CANDIDATES[0]}"
 
 # A candidate that cannot be read is not a candidate. patch --dry-run exits 0 on an EMPTY file,
 # which would select it, make the apply a no-op and still report a change, so size is checked too.
@@ -81,6 +89,26 @@ CANDIDATES=(
 for candidate in "${CANDIDATES[@]}"; do
   if [ ! -s "$candidate" ] || [ ! -r "$candidate" ]; then
     printf 'leapfrog-lock: %s is missing, empty or unreadable\n' "$(basename "$candidate")" >&2
+    exit 1
+  fi
+  # ⚠️ A file that is not a patch at all is caught HERE rather than when it happens to be probed.
+  # With the newest candidate first, a corrupt older one is never reached on a guarded tree — the
+  # newest reverses, the run says "current", and a broken file sits in the repo unreported. A
+  # unified diff has a +++ header and at least one hunk; anything else cannot apply with -p1 anyway.
+  if ! grep -q '^+++ ' "$candidate" || ! grep -q '^@@ ' "$candidate"; then
+    printf 'leapfrog-lock: %s is not a unified diff (no +++ header or no hunk)\n' \
+      "$(basename "$candidate")" >&2
+    exit 1
+  fi
+  # Superficial headers are not enough: a bogus hunk must be rejected even when this tree will
+  # never probe that older candidate. Status 1 is a normal "does not fit this tree" answer; status
+  # 2 or above is patch being unable to parse or use the file at all.
+  syntax_status=0
+  syntax_output="$(patch --dry-run --forward --batch --no-backup-if-mismatch \
+    -d "$PLUGIN_DIR" -p1 2>&1 < "$candidate")" || syntax_status=$?
+  if [ "$syntax_status" -ge 2 ]; then
+    printf 'leapfrog-lock: %s could not be parsed as a unified diff (patch exit %s)\n%s\n' \
+      "$(basename "$candidate")" "$syntax_status" "${syntax_output:-(no detail)}" >&2
     exit 1
   fi
 done
@@ -196,9 +224,44 @@ if grep -qF 'property int fingerprintFastFailures' "$SERVICE"; then
       < "$candidate")" || reverse_status=$?
     case "$reverse_status" in
       0)
-        remove_leftover_backup
-        printf 'leapfrog-lock: current\n'
-        exit 0
+        if [ "$candidate" = "$PREFERRED" ]; then
+          remove_leftover_backup
+          printf 'leapfrog-lock: current\n'
+          exit 0
+        fi
+        # ⚠️ A WHOLE GUARD, BUT AN OLDER ONE. Reversing it here and falling through to the apply
+        # below is what lets a fix to the guard reach a plugin that already carries it. Without
+        # this path a new candidate never reaches a guarded machine, and rewriting a candidate in
+        # place instead refuses as part-patched and stops the sync. Prove the preferred guard fits
+        # BEFORE reversing anything: an older plugin that cannot take it keeps its old guard.
+        upgrade_probe_dir="$(mktemp -d)"
+        cp "$SERVICE" "$upgrade_probe_dir/Service.qml"
+        preferred_status=0
+        preferred_probe="$(patch --reverse --forward --batch --no-backup-if-mismatch \
+          -d "$upgrade_probe_dir" -p1 2>&1 < "$candidate" && \
+          patch --dry-run --forward --batch --no-backup-if-mismatch \
+          -d "$upgrade_probe_dir" -p1 2>&1 < "$PREFERRED")" || preferred_status=$?
+        rm -rf -- "$upgrade_probe_dir"
+        if [ "$preferred_status" -eq 0 ]; then
+          remove_leftover_backup
+        fi
+        if [ "$preferred_status" -ne 0 ]; then
+          printf 'leapfrog-lock: cannot upgrade to %s on this plugin version (patch exit %s)\n%s\n' \
+            "$(basename "$PREFERRED")" "$preferred_status" "${preferred_probe:-(no detail)}" >&2
+          exit 1
+        fi
+        upgrade_status=0
+        upgrade_output="$(patch --reverse --forward --batch --no-backup-if-mismatch \
+          -d "$PLUGIN_DIR" -p1 2>&1 < "$candidate")" || upgrade_status=$?
+        if [ "$upgrade_status" -ne 0 ]; then
+          printf 'leapfrog-lock: could not remove the older guard %s to upgrade it (patch exit %s)\n%s\n' \
+            "$(basename "$candidate")" "$upgrade_status" "${upgrade_output:-(no detail)}" >&2
+          exit 1
+        fi
+        rm -f "$SERVICE.orig" "$SERVICE.rej" 2>/dev/null || true
+        printf 'leapfrog-lock: upgrading from %s\n' "$(basename "$candidate")"
+        upgrading=yes
+        break
         ;;
       1)
         reverse_log="$reverse_log$(basename "$candidate"):"$'\n'"${reverse:-(no detail)}"$'\n'
@@ -210,9 +273,11 @@ if grep -qF 'property int fingerprintFastFailures' "$SERVICE"; then
         ;;
     esac
   done
-  printf 'leapfrog-lock: the guard is only partly applied; the lock service needs review\n' >&2
-  printf '%s' "$reverse_log" >&2
-  exit 1
+  if [ "${upgrading:-no}" != yes ]; then
+    printf 'leapfrog-lock: the guard is only partly applied; the lock service needs review\n' >&2
+    printf '%s' "$reverse_log" >&2
+    exit 1
+  fi
 fi
 
 # Each dry run is a PROBE, and a candidate that does not fit is the normal path here: the

@@ -47,8 +47,22 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     # ⚠️ >/dev/null 2>&1, not 2>/dev/null. patch writes "Unreversed patch detected! Skipping patch."
     # and "saving rejects to file Service.qml.rej" to STDOUT, so half a redirection leaks them into
     # this script's own output (the machine agent, hobnob #6670).
-    patch -R --forward --batch --silent --no-backup-if-mismatch -d "$lock_base" -p1 \
-      < "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch" >/dev/null 2>&1 || lock_base_ok=no
+      # Any candidate may be the one this machine carries, so try each in turn.
+      # ⚠️ EXIT 0 IS NOT PROOF. --forward makes patch SKIP hunks that look already-reversed, so a
+      # candidate this plugin does NOT carry reverses "successfully" having changed nothing. The
+      # marker going away is the only proof the right one came off, and the copy is taken again
+      # each time so a half-applied attempt cannot poison the next.
+      lock_base_ok=no
+      for base_candidate in "$LEAPFROG_DIR/lock/"fingerprint-circuit-breaker*.patch; do
+        cp "$lock_plugin/Service.qml" "$lock_base/Service.qml"
+        patch -R --forward --batch --silent --no-backup-if-mismatch -d "$lock_base" -p1 \
+          < "$base_candidate" >/dev/null 2>&1 || true
+        rm -f "$lock_base"/*.orig "$lock_base"/*.rej
+        if ! grep -qF 'property int fingerprintFastFailures' "$lock_base/Service.qml"; then
+          lock_base_ok=yes
+          break
+        fi
+      done
   fi
   rm -f "$lock_base"/*.orig "$lock_base"/*.rej
   grep -qF 'property int fingerprintFastFailures' "$lock_base/Service.qml" && lock_base_ok=no
@@ -64,7 +78,7 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     }
     lock_guard() { # lock_guard <dir> — apply the v1.7 guard, quietly
       patch --forward --batch --silent --no-backup-if-mismatch -d "$1" -p1 \
-        < "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch" >/dev/null 2>&1
+        < "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch" >/dev/null 2>&1
       rm -f "$1"/*.orig "$1"/*.rej
     }
     lock_run() { # lock_run <dir> — stdout+stderr of the guard, status in lock_status
@@ -80,7 +94,8 @@ if [ -f "$lock_plugin/Service.qml" ]; then
       ( cd "$LEAPFROG_DIR/lock" && sha256sum --check --strict patch-checksums.txt ) 2>&1 | grep -v ': OK$' >&2
       exit 1
     fi
-    for candidate_name in fingerprint-circuit-breaker.patch fingerprint-circuit-breaker-v1.7.patch; do
+    for candidate_name in fingerprint-circuit-breaker.patch fingerprint-circuit-breaker-v1.7.patch \
+      fingerprint-circuit-breaker-v1.8.patch; do
       if ! grep -qF "  $candidate_name" "$LEAPFROG_DIR/lock/patch-checksums.txt"; then
         printf 'lock/patch-checksums.txt does not list %s\n' "$candidate_name" >&2
         exit 1
@@ -121,10 +136,10 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     cp "$LEAPFROG_DIR/lock/"*.patch "$lock_work/dup/lock/"
     cp "$LEAPFROG_DIR/lock/patch-checksums.txt" "$lock_work/dup/lock/patch-checksums.txt"
     awk '/^@@/ { hunks++ } hunks < 4 { print } hunks >= 4 { exit }' \
-      "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch" \
-      > "$lock_work/dup/lock/fingerprint-circuit-breaker-v1.7.patch"
+      "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch" \
+      > "$lock_work/dup/lock/fingerprint-circuit-breaker-v1.8.patch"
     ( cd "$lock_work/dup/lock" \
-      && sha256sum fingerprint-circuit-breaker-v1.7.patch >> patch-checksums.txt )
+      && sha256sum fingerprint-circuit-breaker-v1.8.patch >> patch-checksums.txt )
     tree="$(lock_tree dupmanifest)"
     printf 'backup\n' > "$tree/Service.qml.orig"
     dup_status=0
@@ -147,7 +162,7 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     # 2. An unguarded stage — the path the ship sync actually takes — reports exactly one line.
     #    A leaked probe line here is how "1 out of 6 hunks FAILED" reached the sync's note on a run
     #    that went on to succeed and exit 0 (the machine agent, hobnob #6586).
-    expected_change="leapfrog-lock: changed with fingerprint-circuit-breaker-v1.7.patch"
+    expected_change="leapfrog-lock: changed with fingerprint-circuit-breaker-v1.8.patch"
     expected_change="$expected_change (restart the shell while unlocked, or sign in again)"
     tree="$(lock_tree unguarded)"; lock_run "$tree"
     if [ "$lock_status" -ne 0 ] || [ "$lock_output" != "$expected_change" ]; then
@@ -160,6 +175,84 @@ if [ -f "$lock_plugin/Service.qml" ]; then
       printf 'lock/install left a backup beside the plugin after a clean apply\n' >&2
       exit 1
     fi
+
+    # 2b. ⚠️ AN OLDER GUARD IS UPGRADED, NOT CALLED "current". Every entry in CANDIDATES after the
+    #     first is a guard some machine still carries, and reversing it is the only way a fix to the
+    #     guard reaches that machine. A build that reports "current" for any whole guard leaves those
+    #     machines on the old one for good — which is how the wake-from-sleep fault would have
+    #     survived its own fix (@leapfrog, 2026-11-02 sleep tests).
+    original_tree="$(lock_tree older-fingerprint-circuit-breaker)"
+    if ! git -C "$lock_plugin" show HEAD:Service.qml > "$original_tree/Service.qml"; then
+      printf 'script/check: cannot build the original guard fixture from the plugin history\n' >&2
+      exit 1
+    fi
+    for older in "$LEAPFROG_DIR/lock/"fingerprint-circuit-breaker*.patch; do
+      [ "$older" = "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch" ] && continue
+      if [ "$(basename "$older")" = fingerprint-circuit-breaker.patch ]; then
+        tree="$original_tree"
+        if ! patch --forward --batch --silent --no-backup-if-mismatch -d "$tree" -p1 \
+          < "$older" >/dev/null 2>&1; then
+          printf 'script/check: cannot apply the original guard to its historical fixture\n' >&2
+          exit 1
+        fi
+      else
+        tree="$(lock_tree "older-$(basename "$older" .patch)")"
+        if ! patch --forward --batch --silent --no-backup-if-mismatch -d "$tree" -p1 \
+          < "$older" >/dev/null 2>&1; then
+          printf 'script/check: cannot build the required upgrade fixture for %s\n' \
+            "$(basename "$older")" >&2
+          exit 1
+        fi
+      fi
+      rm -f "$tree"/*.rej
+      if [ "$(basename "$older")" = fingerprint-circuit-breaker.patch ]; then
+        printf 'recovery backup\n' > "$tree/Service.qml.orig"
+        original_before="$(sha256sum "$tree/Service.qml")"
+      fi
+      lock_run "$tree"
+      if [ "$(basename "$older")" = fingerprint-circuit-breaker.patch ]; then
+        if [ "$lock_status" -eq 0 ]; then
+          printf 'lock/install unexpectedly accepted the incompatible original-plugin upgrade\n' >&2
+          exit 1
+        fi
+        case "$lock_output" in
+          *'cannot upgrade to fingerprint-circuit-breaker-v1.8.patch'*) ;;
+          *)
+            printf 'lock/install did not explain the original-plugin upgrade refusal: %s\n' \
+              "$lock_output" >&2
+            exit 1
+            ;;
+        esac
+        if ! grep -qF 'fingerprintFastFailures' "$tree/Service.qml" \
+          || grep -qF 'fingerprintActiveCooldown' "$tree/Service.qml"; then
+          printf 'lock/install removed the original guard after refusing the upgrade\n' >&2
+          exit 1
+        fi
+        if [ ! -e "$tree/Service.qml.orig" ] \
+          || [ "$(sha256sum "$tree/Service.qml")" != "$original_before" ]; then
+          printf 'lock/install changed the original QML or deleted its backup after refusal\n' >&2
+          exit 1
+        fi
+        continue
+      fi
+      if [ "$lock_status" -ne 0 ]; then
+        printf 'lock/install failed on a tree carrying %s: %s\n' "$(basename "$older")" "$lock_output" >&2
+        exit 1
+      fi
+      case "$lock_output" in
+        *'upgrading from '*) ;;
+        *)
+          printf 'lock/install did not upgrade a tree carrying %s: %s\n' \
+            "$(basename "$older")" "$lock_output" >&2
+          exit 1
+          ;;
+      esac
+      if ! grep -qF 'fingerprintCooldown' "$tree/Service.qml"; then
+        printf 'lock/install reported an upgrade from %s but left the old guard in place\n' \
+          "$(basename "$older")" >&2
+        exit 1
+      fi
+    done
 
     # 3. ⚠️ THE CASE THAT ENFORCES --forward ON THE REVERSE PROBE, and the only one that does. A
     #    hunk-1-only tree is refused with or without the flag, so the obvious part-patched case
@@ -189,7 +282,7 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     #    needs it (the machine agent, hobnob #6639).
     tree="$(lock_tree hunk1only)"
     awk '/^@@/ { hunks++ } hunks < 2 { print } hunks >= 2 { exit }' \
-      "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch" > "$lock_work/hunk1.patch"
+      "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch" > "$lock_work/hunk1.patch"
     patch --forward --batch --silent --no-backup-if-mismatch -d "$tree" -p1 \
       < "$lock_work/hunk1.patch" >/dev/null 2>&1
     rm -f "$tree"/*.orig "$tree"/*.rej
@@ -222,12 +315,13 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     mkdir -p "$lock_work/corrupt/lock"
     cp "$LEAPFROG_DIR/lock/install" "$lock_work/corrupt/lock/install"
     cp "$LEAPFROG_DIR/lock/"*.patch "$lock_work/corrupt/lock/"
-    printf '@@ -1,BOGUS +1,3 @@\n' > "$lock_work/corrupt/lock/fingerprint-circuit-breaker.patch"
+    printf '%s\n' -- '--- a/Service.qml' '+++ b/Service.qml' '@@ -1,BOGUS +1,3 @@' > "$lock_work/corrupt/lock/fingerprint-circuit-breaker.patch"
     # ⚠️ The manifest has to be rebuilt for the corrupted copy, or the run stops at the checksum step
     # and never reaches the exit-2 handling this case exists to test — which is what 0008 did to it
     # (the machine agent's review, hobnob #6699).
     ( cd "$lock_work/corrupt/lock" \
       && sha256sum fingerprint-circuit-breaker.patch fingerprint-circuit-breaker-v1.7.patch \
+        fingerprint-circuit-breaker-v1.8.patch \
         > patch-checksums.txt )
     # ⚠️ BOTH tree states. A guarded tree reaches the REVERSE probe and an unguarded one the
     # FORWARD probe, so testing only the guarded tree leaves the forward probe's redirections
