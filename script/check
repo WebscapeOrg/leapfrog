@@ -93,7 +93,7 @@ if [ -f "$lock_plugin/Service.qml" ]; then
       # longer fits the local plugin ended this script with exit 1 and no message at all
       # (the machine agent, hobnob #10079).
       if ! patch --forward --batch --silent --no-backup-if-mismatch -d "$1" -p1 \
-        < "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch" >/dev/null 2>&1; then
+        < "$LEAPFROG_DIR/lock/$lock_preferred" >/dev/null 2>&1; then
         printf 'script/check: the newest guard no longer applies to the local lock plugin\n' >&2
         exit 1
       fi
@@ -104,6 +104,20 @@ if [ -f "$lock_plugin/Service.qml" ]; then
       lock_output="$("$LEAPFROG_DIR/lock/install" --plugin-dir "$1" 2>&1)" || lock_status=$?
     }
 
+    # ⚠️ THE PREFERRED CANDIDATE IS READ OUT OF lock/install, NEVER NAMED HERE. Every case below
+    # used to spell out the then-newest patch, so adding v1.9 broke five of them at once while the
+    # guard itself was correct (the MacBook agent, 2026-11-10). A fixture built from a name that
+    # goes stale tests the name, not the behaviour.
+    lock_candidate_names() { # the patch file names install prefers, newest first
+      sed -n '/^CANDIDATES=(/,/^)/p' "$LEAPFROG_DIR/lock/install" \
+        | sed -n 's|.*/lock/\([^"]*\.patch\)".*|\1|p'
+    }
+    lock_preferred="$(lock_candidate_names | head -1)"
+    if [ -z "$lock_preferred" ] || [ ! -r "$LEAPFROG_DIR/lock/$lock_preferred" ]; then
+      printf 'script/check: could not read the preferred candidate out of lock/install\n' >&2
+      exit 1
+    fi
+
     # 0. The checksum manifest must match the patch files. lock/install refuses to run when they
     #    disagree, so this only exists to fail with a clear message here rather than on a ship.
     if ! (cd "$LEAPFROG_DIR/lock" && sha256sum --check --quiet --strict patch-checksums.txt) >/dev/null 2>&1
@@ -112,8 +126,7 @@ if [ -f "$lock_plugin/Service.qml" ]; then
       ( cd "$LEAPFROG_DIR/lock" && sha256sum --check --strict patch-checksums.txt ) 2>&1 | grep -v ': OK$' >&2
       exit 1
     fi
-    for candidate_name in fingerprint-circuit-breaker.patch fingerprint-circuit-breaker-v1.7.patch \
-      fingerprint-circuit-breaker-v1.8.patch; do
+    for candidate_name in $(lock_candidate_names); do
       if ! grep -qF "  $candidate_name" "$LEAPFROG_DIR/lock/patch-checksums.txt"; then
         printf 'lock/patch-checksums.txt does not list %s\n' "$candidate_name" >&2
         exit 1
@@ -154,10 +167,10 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     cp "$LEAPFROG_DIR/lock/"*.patch "$lock_work/dup/lock/"
     cp "$LEAPFROG_DIR/lock/patch-checksums.txt" "$lock_work/dup/lock/patch-checksums.txt"
     awk '/^@@/ { hunks++ } hunks < 4 { print } hunks >= 4 { exit }' \
-      "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch" \
-      > "$lock_work/dup/lock/fingerprint-circuit-breaker-v1.8.patch"
+      "$LEAPFROG_DIR/lock/$lock_preferred" \
+      > "$lock_work/dup/lock/$lock_preferred"
     ( cd "$lock_work/dup/lock" \
-      && sha256sum fingerprint-circuit-breaker-v1.8.patch >> patch-checksums.txt )
+      && sha256sum "$lock_preferred" >> patch-checksums.txt )
     tree="$(lock_tree dupmanifest)"
     printf 'backup\n' > "$tree/Service.qml.orig"
     dup_status=0
@@ -180,7 +193,7 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     # 2. An unguarded stage — the path the ship sync actually takes — reports exactly one line.
     #    A leaked probe line here is how "1 out of 6 hunks FAILED" reached the sync's note on a run
     #    that went on to succeed and exit 0 (the machine agent, hobnob #6586).
-    expected_change="leapfrog-lock: changed with fingerprint-circuit-breaker-v1.8.patch"
+    expected_change="leapfrog-lock: changed with $lock_preferred"
     expected_change="$expected_change (restart the shell while unlocked, or sign in again)"
     tree="$(lock_tree unguarded)"; lock_run "$tree"
     if [ "$lock_status" -ne 0 ] || [ "$lock_output" != "$expected_change" ]; then
@@ -214,7 +227,7 @@ if [ -f "$lock_plugin/Service.qml" ]; then
       exit 1
     fi
     for older in "$LEAPFROG_DIR/lock/"fingerprint-circuit-breaker*.patch; do
-      [ "$older" = "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch" ] && continue
+      [ "$older" = "$LEAPFROG_DIR/lock/$lock_preferred" ] && continue
       if [ "$(basename "$older")" = fingerprint-circuit-breaker.patch ]; then
         tree="$original_tree"
         if ! patch --forward --batch --silent --no-backup-if-mismatch -d "$tree" -p1 \
@@ -243,7 +256,7 @@ if [ -f "$lock_plugin/Service.qml" ]; then
           exit 1
         fi
         case "$lock_output" in
-          *'cannot upgrade to fingerprint-circuit-breaker-v1.8.patch'*) ;;
+          *"cannot upgrade to $lock_preferred"*) ;;
           *)
             printf 'lock/install did not explain the original-plugin upgrade refusal: %s\n' \
               "$lock_output" >&2
@@ -274,9 +287,15 @@ if [ -f "$lock_plugin/Service.qml" ]; then
           exit 1
           ;;
       esac
-      if ! grep -qF 'fingerprintCooldown' "$tree/Service.qml"; then
-        printf 'lock/install reported an upgrade from %s but left the old guard in place\n' \
-          "$(basename "$older")" >&2
+      # ⚠️ THE WHOLE FILE, NOT A MARKER. A marker belongs to one version: 'fingerprintCooldown'
+      # proved the upgrade from v1.7 but is already in v1.8, so once v1.9 arrived an upgrade that
+      # put v1.8 straight back passed here. An upgraded tree must equal the unguarded base with the
+      # preferred guard applied, whichever candidate it started from.
+      upgrade_expected="$(lock_tree "expected-$(basename "$older" .patch)")"
+      lock_guard "$upgrade_expected"
+      if ! cmp -s "$tree/Service.qml" "$upgrade_expected/Service.qml"; then
+        printf 'lock/install reported an upgrade from %s but did not leave %s in place\n' \
+          "$(basename "$older")" "$lock_preferred" >&2
         exit 1
       fi
     done
@@ -309,7 +328,7 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     #    needs it (the machine agent, hobnob #6639).
     tree="$(lock_tree hunk1only)"
     awk '/^@@/ { hunks++ } hunks < 2 { print } hunks >= 2 { exit }' \
-      "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch" > "$lock_work/hunk1.patch"
+      "$LEAPFROG_DIR/lock/$lock_preferred" > "$lock_work/hunk1.patch"
     if ! patch --forward --batch --silent --no-backup-if-mismatch -d "$tree" -p1 \
       < "$lock_work/hunk1.patch" >/dev/null 2>&1; then
       printf 'script/check: could not build a hunk-1-only tree; the first hunk no longer applies\n' >&2
@@ -350,9 +369,7 @@ if [ -f "$lock_plugin/Service.qml" ]; then
     # and never reaches the exit-2 handling this case exists to test — which is what 0008 did to it
     # (the machine agent's review, hobnob #6699).
     ( cd "$lock_work/corrupt/lock" \
-      && sha256sum fingerprint-circuit-breaker.patch fingerprint-circuit-breaker-v1.7.patch \
-        fingerprint-circuit-breaker-v1.8.patch \
-        > patch-checksums.txt )
+      && sha256sum $(lock_candidate_names) > patch-checksums.txt )
     # ⚠️ BOTH tree states. A guarded tree reaches the REVERSE probe and an unguarded one the
     # FORWARD probe, so testing only the guarded tree leaves the forward probe's redirections
     # uncovered here (the machine agent's review, hobnob #6720).

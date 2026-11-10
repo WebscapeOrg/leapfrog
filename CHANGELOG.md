@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.14 — 2026-11-10
+
+- The lock screen lets go of the fingerprint reader while the screen is dark.
+  An unattended lock screen asked the reader for a finger every 30 seconds,
+  and every round switched the T1's biometric keybag off and on, about 120
+  times an hour. Twice one of those switches failed and the keybag service
+  then refused until a reboot, taking Touch ID with it. The reader now follows
+  the camera's rule: no round on a dark screen, the running round dropped when
+  the screen blanks, and a fresh one when the lock screen sees it come back.
+  Until a key or the trackpad reaches it, a screen that wakes by itself (a
+  resume, the idle service ending its cycle) does not listen for a finger yet.
+  This ships as guard v1.9, a new candidate, so a plugin on v1.8 upgrades.
+- `script/check` reads the newest candidate out of `lock/install` instead of
+  naming it in nine places, and proves an upgrade by comparing the whole file
+  with a fresh tree carrying the newest guard. A marker check could not tell
+  v1.8 from v1.9.
+
 ## 0.2.13 — 2026-11-10
 
 - The agents' working notes under `docs/` stay out of git. They hold private

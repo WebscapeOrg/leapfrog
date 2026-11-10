@@ -76,6 +76,7 @@ fi
 # the marker is there, nothing reverses, and the run refuses — which stops the whole ship sync, not
 # just the guard (measured 2026-11-09, before the upgrade path below existed).
 CANDIDATES=(
+  "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.9.patch"
   "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.8.patch"
   "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker-v1.7.patch"
   "$LEAPFROG_DIR/lock/fingerprint-circuit-breaker.patch"

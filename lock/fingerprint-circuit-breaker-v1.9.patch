@@ -1,0 +1,214 @@
+--- a/Service.qml	2026-11-10 18:14:12.243958519 +0000
++++ b/Service.qml	2026-11-10 18:14:12.244958539 +0000
+@@ -2840,6 +2840,15 @@
+   property bool pendingSessionLock: false
+   property bool authenticatingPassword: false
+   property bool fingerprintAuthenticating: false
++  // A broken fingerprint service must not become an unbounded PAM loop. A
++  // normal rejected scan takes long enough to reset this streak; an immediate
++  // service failure opens the circuit for this lock and leaves password auth.
++  property int fingerprintFastFailures: 0
++  property double fingerprintStartedAt: 0
++  property bool fingerprintPaused: false
++  property double fingerprintPausedAt: 0
++  property int fingerprintCooldown: 15000
++  property int fingerprintActiveCooldown: 15000
+   property bool faceAuthenticating: false
+   // Face retries on its own after a miss, but not forever: a camera that
+   // errors out at once would otherwise spin the PAM stack four times a
+@@ -3199,6 +3208,12 @@
+     fido2FailurePending = false
+     authenticatingPassword = false
+     fingerprintAuthenticating = false
++    fingerprintFastFailures = 0
++    fingerprintStartedAt = 0
++    fingerprintPaused = false
++    fingerprintPausedAt = 0
++    fingerprintCooldown = 15000
++    fingerprintActiveCooldown = 15000
+     fingerprintRetryTimer.stop()
+     clearFingerprintStatus()
+     faceMisses = 0
+@@ -3345,6 +3360,7 @@
+         Qt.callLater(retryFace)
+     }
+     if (wasBlanked && lockRequested && sessionLock.secure) Qt.callLater(retryFido2)
++    if (wasBlanked && lockRequested && sessionLock.secure) Qt.callLater(resumeFingerprintRound)
+     // Failsafe: a wake that never exits must not leave the field inert.
+     if (inputBlocked && !inputUnblockTimer.running) {
+       inputUnblockTimer.interval = 3000
+@@ -3362,6 +3378,12 @@
+     // Nothing to authenticate to while the panel is dark: drop the scan and
+     // let go of the camera until it comes back.
+     if (screenBlanked) stopFace()
++    // ⚠️ THE LINE ABOVE IS AN ASSIGNMENT, NOT ONLY A SET. With the HDMI workaround flapping,
++    // runBlank reaches here having just CLEARED screenBlanked on a panel whose round was already
++    // let go of, and nothing else would ever re-arm it: Touch ID gone for the rest of that lock,
++    // password still working, no error anywhere (hostile read, 2026-11-10).
++    if (screenBlanked) stopFingerprintRound()
++    else resumeFingerprintRound()
+     if (!blankProcess.running) blankProcess.running = true
+   }
+ 
+@@ -3405,16 +3427,110 @@
+     runWake()
+   }
+ 
++  // Let go of the reader while the panel is dark. The round stops here rather than running on
++  // into a timeout, so the keybag is not cycled again until somebody comes back.
++  function stopFingerprintRound() {
++    fingerprintRetryTimer.stop()
++    if (fingerprintPam.active) fingerprintPam.abort()
++    fingerprintAuthenticating = false
++    // The prompt goes with the round. Left standing, the screen still reads "Place your right index
++    // finger on the fingerprint reader" while no round exists, and the user presses the sensor
++    // against an invitation nothing is listening to. The fido2 path drops its status the same way.
++    clearFingerprintStatus()
++  }
++
++  // The counterpart, called from runWake. It must not call startFingerprint directly while the
++  // breaker is open: that returns early before the cooldown has elapsed, and with the retry timer
++  // stopped by the blanking nothing would ever re-arm it, so Touch ID would be gone for the rest
++  // of the lock. Re-arm the timer for what is left of the cooldown instead.
++  function resumeFingerprintRound() {
++    if (!lockRequested || !sessionLock.secure || !fingerprintConfigured || screenBlanked) return
++    if (fingerprintPam.active || fingerprintAuthenticating) return
++    if (fingerprintPaused) {
++      var left = fingerprintActiveCooldown - (Date.now() - fingerprintPausedAt)
++      fingerprintRetryTimer.interval = left > 0 ? left : 1
++      fingerprintRetryTimer.restart()
++      return
++    }
++    startFingerprint()
++  }
++
+   function startFingerprint() {
++    // An open circuit is a cooldown, not a verdict. Only the retry timer armed in
++    // scheduleFingerprintRetry reaches here while paused, and only once the cooldown has elapsed on
++    // the WALL CLOCK -- which also covers a suspend, the way idleBlankTimer reads a sleep from the
++    // gap rather than from an event, since this service subscribes to nothing from logind.
++    // ⚠️ A DARK PANEL MEANS NOBODY IS AT THE READER, and every round switches the T1's biometric
++    // keybag off and on. Left armed, an unattended lock screen cycles it about 120 times an hour --
++    // 30 s waiting for a finger, then scheduleFingerprintRetry's 250 ms slow-failure branch, all
++    // night. On 2026-11-09 09:05 and 2026-11-03 14:02 one of those cycles failed to activate the
++    // keybag and t1bridge-keybag then refused for the rest of the boot (1,945 and 1,473 restarts),
++    // taking Touch ID with it until a reboot. startFace already refuses on a dark panel for
++    // the camera's sake; this is the same rule for the same reason. runWake starts a fresh round
++    // when the lock screen sees the panel come back, so the reader is not armed for the press that
++    // wakes the machine, nor for a panel the machine lights by itself (a resume, the idle service
++    // ending its cycle) until a key or the trackpad reaches the lock screen. Face and the security
++    // key have the same gap (upstream t1bridge#14 for the keybag).
++    // ⚠️ ABOVE the breaker block on purpose: below it, a call arriving while dark cleared
++    // fingerprintPaused and logged "fingerprint-resumed" for a round that never began, which is a
++    // lie to whoever reads the log chasing the next keybag incident (hostile read, 2026-11-10).
++    if (screenBlanked) return
++    if (fingerprintPaused) {
++      if (Date.now() - fingerprintPausedAt < fingerprintActiveCooldown) return
++      fingerprintPaused = false
++      logEvent("fingerprint-resumed: cooldown elapsed")
++    }
+     if (!lockRequested || !sessionLock.secure || !fingerprintConfigured) return
+     if (fingerprintPam.active || fingerprintAuthenticating) return
+ 
+     fingerprintAuthenticating = true
++    fingerprintStartedAt = Date.now()
+     if (!fingerprintPam.start()) {
+       fingerprintAuthenticating = false
++      scheduleFingerprintRetry()
+     }
+   }
+ 
++  function scheduleFingerprintRetry() {
++    // screenBlanked here is insurance for a result landing just after the panel goes dark. On this
++    // Quickshell build PamContext.abort() emits neither completed nor error, so the path was not
++    // reachable when it was probed (2026-11-10); abort's behaviour is an implementation detail, and
++    // runBlank sets screenBlanked before it stops the round, so this stays cheap and correct.
++    if (!lockRequested || !fingerprintConfigured || fingerprintPaused || screenBlanked) return
++
++    var elapsed = fingerprintStartedAt > 0 ? Date.now() - fingerprintStartedAt : 0
++    if (elapsed < 1000) {
++      fingerprintFastFailures += 1
++      if (fingerprintFastFailures >= 3) {
++        // OPEN, NOT LATCHED. A wake restarts fprintd (the system-sleep hook for libfprint#173)
++        // under a PAM conversation that began before the sleep, so the first failure reads
++        // "fprintd name owner changed during operation" and the retries meet a T1 that is still
++        // resetting: three fast failures about 3 s after EVERY wake. Latching here switched Touch
++        // ID off for the rest of the lock although the broker recovered seconds later, so a lid
++        // open cost the fingerprint reader until the next unlock (@leapfrog, from the 2026-11-02
++        // sleep tests; the same shape as t1bridge-keybag's restart storm that morning). The loop
++        // this guard exists to stop is still stopped -- at most one attempt per cooldown, doubling
++        // to a minute -- but the circuit closes again on its own once the service is back.
++        fingerprintPaused = true
++        fingerprintPausedAt = Date.now()
++        fingerprintActiveCooldown = fingerprintCooldown
++        logEvent("fingerprint-paused: repeated-service-errors, retrying in "
++          + Math.round(fingerprintCooldown / 1000) + "s")
++        fingerprintRetryTimer.interval = fingerprintActiveCooldown
++        fingerprintCooldown = Math.min(fingerprintCooldown * 2, 60000)
++        fingerprintRetryTimer.restart()
++        return
++      }
++      fingerprintRetryTimer.interval = 1000 * Math.pow(2, fingerprintFastFailures - 1)
++    } else {
++      fingerprintFastFailures = 0
++      fingerprintCooldown = 15000
++      fingerprintRetryTimer.interval = 250
++    }
++
++    fingerprintRetryTimer.restart()
++  }
++
+   function handleFingerprintFinished(result) {
+     fingerprintAuthenticating = false
+ 
+@@ -3422,7 +3538,7 @@
+     if (result === PamResult.Success) {
+       finishUnlock()
+     } else if (fingerprintConfigured) {
+-      fingerprintRetryTimer.restart()
++      scheduleFingerprintRetry()
+     }
+   }
+ 
+@@ -3723,7 +3839,9 @@
+         root.pendingSessionLock = false
+         sessionLockStabilizeTimer.stop()
+         pendingSessionLockTimer.stop()
+-        root.startFingerprint()
++        // Through the resume, not startFingerprint: with the breaker open and the retry timer
++        // stopped by a blanking, a direct call returns early and nothing re-arms it.
++        root.resumeFingerprintRound()
+         if (root.faceStart === "always") root.startFace()
+         root.startFido2()
+       }
+@@ -3951,7 +4069,7 @@
+ 
+     onError: function(error) {
+       root.fingerprintAuthenticating = false
+-      if (root.lockRequested && root.fingerprintConfigured) fingerprintRetryTimer.restart()
++      root.scheduleFingerprintRetry()
+     }
+   }
+ 
+@@ -4263,7 +4381,7 @@
+ 
+   Process {
+     id: fingerprintCheckProc
+-    command: ["bash", "-c", "if [[ -f /etc/pam.d/omarchy-lock-fingerprint ]] && command -v fprintd-list >/dev/null 2>&1 && fprintd-list \"$USER\" 2>/dev/null | grep -qi finger; then echo yes; else echo no; fi"]
++    command: ["bash", "-c", "if [[ -f /etc/pam.d/omarchy-lock-fingerprint ]] && systemctl --quiet is-active t1bridge-keybag.service && command -v fprintd-list >/dev/null 2>&1 && fprintd-list \"$USER\" 2>/dev/null | grep -qi finger; then echo yes; else echo no; fi"]
+     stdout: StdioCollector { id: fingerprintCheckStdout; waitForEnd: true }
+     onExited: {
+       root.fingerprintConfigured = String(fingerprintCheckStdout.text || "").trim() === "yes"
+@@ -4462,9 +4580,9 @@
+         root.armBlankTimer()
+         return
+       }
+-      // Only a password check in flight should hold the display up. The
+-      // fingerprint PAM stays armed for the whole lock, so gating on
+-      // `authenticating` here would keep the panel lit until unlock.
++      // Only a password check in flight should hold the display up. A fingerprint round runs
++      // whenever the panel is lit — it is dropped when the panel goes dark and started again on
++      // wake — so gating on `authenticating` here would keep the panel lit until unlock.
+       if (root.lockRequested && !root.authenticatingPassword) root.runBlank()
+     }
+   }
