@@ -3,3 +3,5 @@
 /theme-gallery/themes.js
 *.png
 *.core
+# Agents' working notes (task and question lists, Peacock pages) stay on this machine.
+/docs/

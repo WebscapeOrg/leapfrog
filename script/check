@@ -3,6 +3,18 @@ set -euo pipefail
 
 LEAPFROG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# The agents' working notes under docs/ hold private details, and this repository is public.
+# .gitignore stops them being added, but not a forced add or a file tracked before the rule, so
+# the index is checked too.
+if git -C "$LEAPFROG_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  tracked_docs="$(git -C "$LEAPFROG_DIR" ls-files -- docs/)"
+  if [ -n "$tracked_docs" ]; then
+    printf 'script/check: files under docs/ are tracked by git and must stay off GitHub:\n%s\n' \
+      "$tracked_docs" >&2
+    exit 1
+  fi
+fi
+
 cargo fmt --manifest-path "$LEAPFROG_DIR/touchbar/Cargo.toml" --check
 cargo clippy --manifest-path "$LEAPFROG_DIR/touchbar/Cargo.toml" --all-targets -- -D warnings
 cargo test --manifest-path "$LEAPFROG_DIR/touchbar/Cargo.toml"

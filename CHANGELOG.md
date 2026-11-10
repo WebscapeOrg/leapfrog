@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.13 — 2026-11-10
+
+- The agents' working notes under `docs/` stay out of git. They hold private
+  details and this repository is public. Nothing under `docs/` has ever been
+  committed, and `.gitignore` now keeps it that way. `script/check` also fails
+  if any file there is tracked, because an ignore rule does not stop a forced
+  add or a file tracked before the rule.
+
 ## 0.2.12 — 2026-11-09
 
 - `script/check` gives the same answer on every machine. Its fixture for the
